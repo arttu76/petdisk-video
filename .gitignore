@@ -1,0 +1,3 @@
+# Made by build.sh and the server: build products, logs, stream state
+build/
+__pycache__/

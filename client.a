@@ -1,0 +1,241 @@
+; PETdisk Video (PDV) PET client, machine code part.
+; build.sh joins it with the BASIC loop in stub.bas.in.
+; Each frame is received into a RAM buffer and then copied to the screen in
+; about 20 ms, so frames do not tear. Bytes are read with an inline IEEE-488
+; handshake (see the get macro), not with the kernal.
+
+!cpu 6502
+!ifndef DEV  { DEV  = 10 }
+!ifndef COLS { COLS = 80 }
+FRAME  = COLS * 25
+SYNC   = $ff
+ML     = $0800
+SCREEN = $8000
+BUF    = $1000                  ; frame buffer, FRAME bytes
+
+CHKIN  = $ffc6
+CLRCHN = $ffcc
+CHRIN  = $ffcf
+STOP   = $ffe1
+
+; The BASIC part (stub.bas, tokenized by build.sh) opens VIDEO80 or VIDEO40 and
+; calls this code. It returns when a key is pressed: KEYOUT holds the key,
+; 0 for STOP. BASIC then sends the key to the server and reopens the video.
+KEYOUT = ML - 1
+KBCOUNT = $9e                           ; keys in the keyboard buffer
+KBBUF   = $026f                         ; keyboard buffer
+
+; ---------------------------------------------------------------- machine code
+; Stream format, all bytes read with CHRIN:
+;   $FF + FRAME screen codes            key frame
+;   $FE + (skip, count, count codes)... + (0, 0)
+;                                       delta frame: skip cells, then copy
+;   $FD                                 padding, ignored
+;   $FC                                 nothing to play: go to the search
+; Frames are built in BUF and copied to the screen when complete.
+KEY   = $ff
+DELTA = $fe
+SEARCH = $fc
+
+; IEEE-488 lines, as used by the BASIC 4 kernal byte-read routine at $F1C0
+VIAPB  = $e840                          ; bit 1 NRFD out, bit 7 DAV in
+IEEEIN = $e820                          ; data in, inverted
+PIACRA = $e821                          ; $34 = NDAC low, $3c = NDAC high
+
+; Read one byte from the talker into A, same handshake as the kernal but
+; inline. Waits as long as needed for DAV and checks STOP while waiting.
+; Uses Y.
+!macro get {
+        lda nrfdh
+        sta VIAPB                       ; NRFD high: ready for data
+-       bit VIAPB
+        bpl +                           ; DAV low: data valid
+        dec tmo
+        bne -
+        jsr chkstop
+        jmp -
++       lda nrfdl
+        sta VIAPB                       ; NRFD low
+        lda IEEEIN
+        eor #$ff
+        ldy #$3c
+        sty PIACRA                      ; NDAC high: accepted
+        tay
+-       bit VIAPB
+        bpl -                           ; wait for DAV high
+        lda #$34
+        sta PIACRA                      ; NDAC low
+        tya
+}
+
+* = ML
+        jmp start                       ; SYS ML: play logical file 2
+        jmp text                        ; SYS ML+3: show logical file 4
+
+; logical file X becomes input, the drive becomes talker
+listen  jsr CHKIN
+        lda #$34
+        sta PIACRA                      ; NDAC low
+        lda VIAPB
+        and #$fd
+        sta nrfdl
+        sta VIAPB                       ; NRFD low
+        ora #$02
+        sta nrfdh
+        rts
+
+; ---- text screen: FRAME screen codes straight into screen memory.
+; The search screen comes this way: a known length, because the stock
+; PETdisk firmware does not signal the end of a file opened with OPEN.
+text    ldx #4
+        jsr listen
+        lda #<SCREEN
+        sta tdst+1
+        lda #>SCREEN
+        sta tdst+2
+        lda #<FRAME
+        sta cnt
+        lda #>FRAME
+        sta cnt+1
+tbyte   +get
+tdst    sta SCREEN                      ; address patched
+        inc tdst+1
+        bne +
+        inc tdst+2
++       lda cnt
+        bne +
+        dec cnt+1
++       dec cnt
+        lda cnt
+        ora cnt+1
+        bne tbyte
+        lda #255                        ; not STOP
+        sta KEYOUT
+        jmp CLRCHN
+
+start   ldx #2
+        jsr listen
+
+next    lda KBCOUNT                     ; a key pressed?
+        beq +
+        lda KBBUF
+        sta KEYOUT
+        lda #0
+        sta KBCOUNT
+        jmp leave
++       jsr STOP                        ; Z=1 when STOP is pressed
+        bne +
+        jmp exit
++       +get
+        cmp #KEY
+        beq key
+        cmp #DELTA
+        beq +
+        cmp #SEARCH
+        bne next                        ; padding or junk
+        lda #83                         ; nothing to play: act as if S
+        sta KEYOUT                      ; was pressed, BASIC shows search
+        jmp leave
++       jmp delta
+
+; ---- key frame: FRAME bytes into BUF
+key     lda #<BUF
+        sta kdst+1
+        lda #>BUF
+        sta kdst+2
+        lda #<FRAME
+        sta cnt
+        lda #>FRAME
+        sta cnt+1
+kbyte   +get
+kdst    sta BUF                         ; address patched
+        inc kdst+1
+        bne +
+        inc kdst+2
++       lda cnt                         ; 16-bit countdown
+        bne +
+        dec cnt+1
++       dec cnt
+        lda cnt
+        ora cnt+1
+        beq +
+        jmp kbyte
++       jmp show
+
+; ---- delta frame
+delta   lda #<BUF
+        sta ddst+1
+        lda #>BUF
+        sta ddst+2
+run     +get                            ; skip
+        sta skip
+        +get                            ; count
+        sta cnt
+        ora skip
+        bne +
+        jmp show                        ; (0, 0) ends the frame
++
+        clc
+        lda ddst+1
+        adc skip
+        sta ddst+1
+        bcc +
+        inc ddst+2
++       lda ddst+2
+        cmp #>(BUF + FRAME + 255)
+        bcc +
+        jmp next                        ; corrupt stream: drop this frame
++       lda cnt
+        bne dbyte
+        jmp run
+dbyte   +get
+ddst    sta BUF                         ; address patched
+        inc ddst+1
+        bne +
+        inc ddst+2
+        lda ddst+2
+        cmp #>(BUF + FRAME + 255)
+        bcc +
+        jmp next                        ; corrupt stream: drop this frame
++       dec cnt
+        beq +
+        jmp dbyte
++       jmp run
+
+; ---- copy the finished frame to the screen
+show    ldx #0
+copy
+!for p, 0, (FRAME / 256) - 1 {
+        lda BUF + p * 256, x
+        sta SCREEN + p * 256, x
+}
+        inx
+        bne copy
+!if FRAME % 256 {
+        ldx #0
+tail    lda BUF + (FRAME / 256) * 256, x
+        sta SCREEN + (FRAME / 256) * 256, x
+        inx
+        cpx #FRAME % 256
+        bne tail
+}
+        jmp next
+
+exit    lda #0
+        sta KEYOUT
+leave   jsr CLRCHN
+        rts
+
+; STOP pressed while waiting for data: leave from inside the read macro
+chkstop jsr STOP
+        beq +
+        rts
++       pla                             ; drop the return address
+        pla
+        jmp exit
+
+cnt     !word 0
+skip    !byte 0
+tmo     !byte 0
+nrfdh   !byte 0
+nrfdl   !byte 0

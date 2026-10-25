@@ -1,0 +1,32 @@
+# BASIC part of the PDV client. build.sh removes the lines that start with #
+# and fills in @DEV@, @VIDEO@ and @RESULTS@.
+#
+# Line 10: POKE 59468,12 selects the uppercase/graphics character set on
+# every PET. PRINT CHR$(142) also selects graphics mode, but only the BASIC 4
+# screen editor handles it: on 80-column (CRTC) machines it also sets 8-line
+# character rows. In text mode the CRTC draws each row in 10 lines, which
+# leaves gaps between the rows. BASIC 1 and 2 do not handle CHR$(142), so it
+# is only sent on BASIC 4. The byte at $FFD0 (65488) is the low byte of the
+# kernal's CHRIN jump (JMP at $FFCF). It is 21 only in the BASIC 4 kernal
+# (BASIC 1: 223, BASIC 2: 225).
+10 poke59468,12:ifpeek(65488)=21thenprintchr$(142);
+15 d=@DEV@:k=0
+20 open2,d,2,"@VIDEO@,s,r":sys2048:close2:k=peek(2047)
+30 ifk=0thenprint"{clr}":end
+40 ifk=83ork=211then100
+50 open3,d,3,"k"+mid$(str$(k),2):close3:goto20
+100 open4,d,4,"@RESULTS@,s,r":sys2051:close4:ifpeek(2047)=0then30
+110 print"{home}";:fori=1to23:print"{down}";:next
+120 print"search, number, n/p: ";:q$=""
+130 geta$:ifa$=""then130
+140 ifa$=chr$(13)then200
+150 ifa$=chr$(20)andlen(q$)>0thenq$=left$(q$,len(q$)-1):printa$;:goto130
+160 ifa$<" "ora$>"z"ora$=","ora$=":"ora$=chr$(34)orlen(q$)>55then130
+170 q$=q$+a$:printa$;:goto130
+200 iflen(q$)=0then20
+210 v=val(q$):ifv>0andmid$(str$(v),2)=q$then230
+220 ifq$<>"n"andq$<>"p"then250
+230 open3,d,3,"c"+q$:close3:ifv>0then20
+240 goto100
+250 print"{home}searching...":fori=1tolen(q$)step15:open3,d,3,"q"+mid$(q$,i,15):close3:next
+260 open3,d,3,"q":close3:goto100
