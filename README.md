@@ -223,7 +223,7 @@ Press S on the PET. The PET shows the results of the last search, 20 to a page, 
 
 While the server searches, asks YouTube for more results or opens a video, the top row of the PET screen says so.
 
-The search also works in the server terminal. Press S, type the same entries in the field below the frame, and press RETURN after each entry. The field stays open until a video starts or an empty entry goes back to the video. ESC closes the field.
+The search also works in the server terminal. Press S, type the same entries in the field below the frame, and press RETURN after each entry. The field stays open until a video starts or an empty entry goes back to the video. ESC closes the field. While the PET shows its own search screen, it asks the server every 2.5 seconds whether a video was picked in the server terminal, and then starts it.
 
 ## The server terminal
 
@@ -281,6 +281,7 @@ On the search screen:
 - The search screen reads the file `RESULTS80` (or `RESULTS40`), which the server makes from the current results.
 - Search text goes in pieces: files named `Q` plus up to 15 characters, then a file named only `Q`, which starts the search.
 - A result number, N or P goes to the server as a file named `C<entry>`, for example `C23` or `CN`.
+- While the search screen waits for keys, the PET reads the 1-byte file `PICK` every 2.5 seconds. It holds `1` when the search screen was closed on the server, for example by a video picked in the server terminal. The PET then opens the video file and plays the video.
 
 ## Tests
 

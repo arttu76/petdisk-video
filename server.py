@@ -16,6 +16,7 @@ Run:  server.py VIDEO_OR_URL      converts while it plays, loops files,
 """
 import argparse
 import collections
+import math
 import shutil
 import os
 import re
@@ -199,6 +200,7 @@ class LiveSource:
         self.loop_start = None       # loop marks in seconds, or None
         self.loop_end = None
         self.settings_version = 0    # counts setting changes
+        self.retry_at = None         # time of the next try to get the video
 
         def run():
             while True:
@@ -215,9 +217,16 @@ class LiveSource:
             prev, prev_cols, last_gray = None, None, None
             while not self.leaving():
                 if media is None:
-                    say("could not get the video, trying again in 10 s")
-                    time.sleep(10)
-                    media, self.duration = convert.resolve(self.url, log=say)
+                    # the terminal view counts down to the next try; a new
+                    # video or the search screen ends the wait
+                    self.retry_at = time.monotonic() + self.RETRY
+                    say(f"could not get the video, trying again in {self.RETRY:.0f} s"
+                        if DISPLAY is None else "could not get the video")
+                    while time.monotonic() < self.retry_at and not self.leaving():
+                        time.sleep(0.1)
+                    self.retry_at = None
+                    if not self.leaving():
+                        media, self.duration = convert.resolve(self.url, log=say)
                     continue
                 # ffmpeg starts again after a seek, a zoom change or the
                 # end: the previous frame may have another position or
@@ -299,6 +308,17 @@ class LiveSource:
                 say(f"video ended after {n} frames, starting again at {clock(start)}")
 
         threading.Thread(target=run, daemon=True).start()
+
+    RETRY = 10.0     # seconds before the next try to get the video
+
+    def retry_text(self):
+        """While the decoder waits to try the video again: the countdown
+        for the terminal view, else None."""
+        at = self.retry_at
+        if at is None:
+            return None
+        left = max(1, math.ceil(at - time.monotonic()))
+        return f"could not get the video, trying again in {left} s"
 
     def set_cols(self, cols):
         if cols != self.cols:
@@ -883,6 +903,7 @@ class Display:
     GREEN, INV, NOINV, RESET = "\x1b[32m", "\x1b[7m", "\x1b[27m", "\x1b[0m"
     GREY = "\x1b[90m"                  # server-only text
     YELLOW = "\x1b[33m"                # the search field, easy to find
+    RED = "\x1b[91m"                   # bright red: the video does not play
     BORDER = "\x1b[38;5;238m"          # dark grey frame border
 
     def __init__(self):
@@ -960,6 +981,9 @@ class Display:
         with self.lock:
             server += [e[:w] for e in self.events]
         lines += [f"{self.GREY}{l}{self.RESET}" for l in server]
+        retry = src.retry_text()
+        if retry:
+            lines.append(f"{self.RED}{retry[:w]}{self.RESET}")
         sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in lines) + "\x1b[J")
         sys.stdout.flush()
 
@@ -1091,6 +1115,17 @@ def handle(query, stream, log):
         if q.get("l") == "1" or cols not in stream.source.results_snapshot:
             stream.source.results_snapshot[cols] = stream.source.results_file(cols)
         data = stream.source.results_snapshot[cols]
+        if q.get("l") == "1":
+            return response(f"{len(data)}\r\n".encode())
+        if "s" in q and "e" in q:
+            return response(data[int(q["s"]):int(q["e"])])
+
+    # The PET's search screen asks every few seconds whether the search
+    # screen was closed on the server, for example by a video picked in the
+    # server terminal: "1" makes the PET start the video
+    if re.fullmatch(r"PICK(\.SEQ)?", name.upper()):
+        src = stream.source
+        data = b"1" if src.menu is None and src.url is not None else b"0"
         if q.get("l") == "1":
             return response(f"{len(data)}\r\n".encode())
         if "s" in q and "e" in q:

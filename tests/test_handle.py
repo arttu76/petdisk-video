@@ -106,6 +106,35 @@ class HandleTest(unittest.TestCase):
             self.assertEqual(self.get("file=C1&l=1")[1], b"0\r\n")
             self.assertEqual(src.url, "https://youtu.be/x")
 
+    def pick_file(self):
+        size = int(self.get("file=PICK&l=1")[1])
+        return self.get(f"file=PICK.SEQ&s=0&e=512")[1][:size]
+
+    def test_pick_after_a_terminal_search(self):
+        # the PET shows its own search screen and asks the server every
+        # 2.5 s whether a video was picked in the server terminal
+        src = self.stream.source
+        self.assertEqual(self.get("file=VIDEO80.SEQ&s=0&e=512")[1][0], server.SEARCH)
+        self.get("file=RESULTS80&l=1")                       # the PET's search screen
+        self.assertEqual(self.pick_file(), b"0")
+        src.results = [("A PET VIDEO", 75.0, "https://youtu.be/x")]
+        src.pick(1)                                          # picked in the terminal
+        self.assertEqual(self.pick_file(), b"1")
+
+    def test_pick_after_the_terminal_closes_the_search(self):
+        src = self.stream.source
+        src.url = "https://youtu.be/playing"
+        self.get("file=RESULTS80&l=1")                       # S on the PET
+        self.assertEqual(self.pick_file(), b"0")
+        src.entry("")                                        # empty entry in the terminal
+        self.assertEqual(self.pick_file(), b"1")
+
+    def test_no_pick_while_the_search_screen_shows(self):
+        src = self.stream.source
+        self.get("file=RESULTS40&l=1")
+        src.entry("99")                                      # no such result
+        self.assertEqual(self.pick_file(), b"0")
+
     def test_results_are_read_from_one_snapshot(self):
         # a new search while the PET reads the file must not mix two screens
         src = self.stream.source

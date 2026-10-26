@@ -15,6 +15,12 @@
 # It clears the rest of the row, where the previous header still is, up to
 # @COLS@-1 characters: the header is at most that long, and the last column
 # would wrap the line.
+#
+# Lines 120-136: while the search screen waits for keys, the PET asks the
+# server every 2.5 seconds (150 jiffies of TI) whether the search screen was
+# closed on the server, for example by a video picked in the server
+# terminal. The file PICK then holds "1", and the PET starts the video. TI
+# wraps at midnight, so a TI smaller than T also starts a check.
 10 poke59468,12:ifpeek(65488)=21thenprintchr$(142);
 15 d=@DEV@:k=0
 20 open2,d,2,"@VIDEO@,s,r":sys2048:close2:k=peek(2047)
@@ -23,8 +29,11 @@
 50 open3,d,3,"k"+mid$(str$(k),2):close3:goto20
 100 open4,d,4,"@RESULTS@,s,r":sys2051:close4:ifpeek(2047)=0then30
 110 print"{home}";:fori=1to23:print"{down}";:next
-120 print"search, number, n/p: ";:q$=""
-130 geta$:ifa$=""then130
+120 print"search, number, n/p: ";:q$="":t=ti
+130 geta$:ifa$<>""then140
+132 ifti-t<150andti>=tthen130
+134 t=ti:open3,d,3,"pick,s,r":get#3,a$:close3:ifa$="1"then20
+136 goto130
 140 ifa$=chr$(13)then200
 150 ifa$=chr$(20)andlen(q$)>0thenq$=left$(q$,len(q$)-1):printa$;:goto130
 160 ifa$<" "ora$>"z"ora$=","ora$=":"ora$=chr$(34)orlen(q$)>55then130

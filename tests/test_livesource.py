@@ -263,6 +263,36 @@ class DecoderTest(unittest.TestCase):
         fresh = convert.Matcher(80).codes_for(after).tobytes()
         self.assertEqual(sum(a != b for a, b in zip(latest, fresh)), 0)
 
+    def test_retry_countdown(self):
+        src = live_source()
+        self.assertIsNone(src.retry_text())
+        src.retry_at = 100.0
+        for now, left in ((90.0, 10), (92.5, 8), (99.0, 1), (99.95, 1), (101.0, 1)):
+            with mock.patch.object(server.time, "monotonic", return_value=now):
+                self.assertEqual(src.retry_text(),
+                                 f"could not get the video, trying again in {left} s")
+
+    def test_waiting_decoder_counts_down_and_stops_for_a_new_video(self):
+        calls = []
+
+        def no_video(url, log=None):
+            calls.append(url)
+            return None, None
+
+        ms = {cols: convert.Matcher(cols) for cols in (80, 40)}
+        with mock.patch.object(convert, "resolve", no_video):
+            src = server.LiveSource("https://example.com/gone", ms, 10.0)
+            try:
+                self.wait(lambda: src.retry_text() is not None)
+                self.assertRegex(src.retry_text(),
+                                 r"^could not get the video, trying again in (10|9) s$")
+                src.switch = True                       # the user picked another video
+                src.url = None
+                self.wait(lambda: src.retry_at is None, timeout=2)
+            finally:
+                src.url, src.switch = None, True
+        self.assertEqual(calls, ["https://example.com/gone"])   # no second try
+
     @staticmethod
     def wait(cond, timeout=10):
         deadline = time.monotonic() + timeout
