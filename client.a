@@ -32,10 +32,16 @@ KBBUF   = $026f                         ; keyboard buffer
 ;                                       delta frame: skip cells, then copy
 ;   $FD                                 padding, ignored
 ;   $FC                                 nothing to play: go to the search
+;   $FB + (control, codes)...           run-length key frame, until FRAME
+;                                       cells: control 0-127 is followed by
+;                                       control + 1 literal codes, 128-255
+;                                       by one code, repeated control - 126
+;                                       times
 ; Frames are built in BUF and copied to the screen when complete.
 KEY   = $ff
 DELTA = $fe
 SEARCH = $fc
+RLE   = $fb
 
 ; IEEE-488 lines, as used by the BASIC 4 kernal byte-read routine at $F1C0
 VIAPB  = $e840                          ; bit 1 NRFD out, bit 7 DAV in
@@ -130,13 +136,16 @@ next    lda KBCOUNT                     ; a key pressed?
         cmp #KEY
         beq key
         cmp #DELTA
-        beq +
-        cmp #SEARCH
+        bne +
+        jmp delta
++       cmp #RLE
+        bne +
+        jmp rle
++       cmp #SEARCH
         bne next                        ; padding or junk
         lda #83                         ; nothing to play: act as if S
         sta KEYOUT                      ; was pressed, BASIC shows search
         jmp leave
-+       jmp delta
 
 ; ---- key frame: FRAME bytes into BUF
 key     lda #<BUF
@@ -201,6 +210,55 @@ ddst    sta BUF                         ; address patched
         beq +
         jmp dbyte
 +       jmp run
+
+; ---- run-length key frame: control bytes until FRAME cells are in BUF
+rle     lda #<BUF
+        sta rdst+1
+        lda #>BUF
+        sta rdst+2
+        lda #<FRAME
+        sta cnt
+        lda #>FRAME
+        sta cnt+1
+rctl    +get                            ; control byte
+        bmi rrep
+        clc                             ; 0-127: control + 1 literal codes
+        adc #1
+        sta skip
+rlit    +get
+        jsr rput
+        dec skip
+        bne rlit
+        beq rnext                       ; always
+rrep    sec                             ; 128-255: one code, control - 126 times
+        sbc #126
+        sta skip
+        +get
+rrun    jsr rput
+        dec skip
+        bne rrun
+rnext   lda cnt
+        ora cnt+1
+        beq +
+        jmp rctl
++       jmp show
+
+; store A at rdst and count the cell; a code past the end of the frame
+; means a corrupt stream: drop the frame. Keeps A.
+rput    ldy cnt
+        bne +
+        ldy cnt+1
+        beq rbad
+        dec cnt+1
++       dec cnt
+rdst    sta BUF                         ; address patched
+        inc rdst+1
+        bne +
+        inc rdst+2
++       rts
+rbad    pla                             ; drop the return address
+        pla
+        jmp next
 
 ; ---- copy the finished frame to the screen
 show    ldx #0

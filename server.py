@@ -42,6 +42,7 @@ KEY = 0xFF      # key frame: 2000 screen codes follow
 DELTA = 0xFE    # delta frame: (skip, count, count codes)... then (0, 0)
 PAD = 0xFD      # filler between frames, ignored by the client
 SEARCH = 0xFC   # nothing to play: the client goes to the search screen
+RLE = 0xFB      # run-length key frame: see encode_rle
 
 
 def clock(seconds):
@@ -79,10 +80,50 @@ def screen_code(ch):
     return 32
 
 
+def encode_rle(cur):
+    """Run-length key frame: RLE, then control bytes until the frame is
+    full. A control byte below 128 is followed by that many + 1 literal
+    codes (1..128). 128 and above repeat the next code control - 126 times
+    (2..129). Runs of 3 or more cells are repeated; shorter ones go in the
+    literals, because a repeat ends the literal run and costs a control
+    byte to start the next one."""
+    n = len(cur)
+    out = bytearray([RLE])
+    lit = 0          # start of the pending literal run
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and j - i < 129 and cur[j] == cur[i]:
+            j += 1
+        if j - i >= 3:
+            while lit < i:
+                k = min(128, i - lit)
+                out += bytes([k - 1]) + cur[lit:lit + k]
+                lit += k
+            out += bytes([j - i + 126, cur[i]])
+            lit = j
+        i = j
+    while lit < n:
+        k = min(128, n - lit)
+        out += bytes([k - 1]) + cur[lit:lit + k]
+        lit += k
+    return bytes(out)
+
+
+def encode_frame(prev, cur):
+    """The shortest frame that takes the PET from prev to cur: a delta or a
+    key frame, a key frame when there is no prev."""
+    rle = encode_rle(cur)
+    key = rle if len(rle) < 1 + len(cur) else bytes([KEY]) + bytes(cur)
+    if prev is None:
+        return key
+    delta = encode_delta(prev, cur)
+    return delta if len(delta) < len(key) else key
+
+
 def encode_delta(prev, cur):
     """Runs of changed cells. Gaps of 1-2 unchanged cells are sent as data,
-    because a new run costs two bytes. Falls back to a key frame when the
-    delta would not be smaller."""
+    because a new run costs two bytes."""
     n = len(cur)
     out = bytearray([DELTA])
     pos = 0          # cell the client points at
@@ -114,8 +155,6 @@ def encode_delta(prev, cur):
         pos = j
         i = j
     out += bytes([0, 0])
-    if len(out) >= 1 + n:
-        return bytes([KEY]) + bytes(cur)
     return bytes(out)
 
 
@@ -156,6 +195,7 @@ class LiveSource:
         self.seek_to = None          # set by the seek keys
         self.paused = False
         self.zoom = zoom             # "fit", "fill" or "stretch"
+        self.start_zoom = zoom       # for the R key
         self.loop_start = None       # loop marks in seconds, or None
         self.loop_end = None
         self.settings_version = 0    # counts setting changes
@@ -179,6 +219,10 @@ class LiveSource:
                     time.sleep(10)
                     media, self.duration = convert.resolve(self.url, log=say)
                     continue
+                # ffmpeg starts again after a seek, a zoom change or the
+                # end: the previous frame may have another position or
+                # zoom, so it must not keep any old characters
+                prev = None
                 n = 0
                 for gray in convert.gray_frames(media, fps, big.width,
                                                 big.height, False,
@@ -419,14 +463,15 @@ class LiveSource:
     SEEK_KEYS = {"1": -60.0, "2": -10.0, "3": 10.0, "4": 60.0}
 
     def seek(self, delta):
-        """Jump delta seconds; the video wraps around at both ends."""
+        """Jump delta seconds, but not before the start or past the last
+        frame. From the last frame the video ends and loops as usual."""
         # a seek that the decoder has not done yet counts as the position
         base = self.seek_to if self.seek_to is not None else self.position
-        pos = base + delta
+        pos = max(0.0, base + delta)
         if self.duration:
-            pos %= self.duration
-        self.position = max(0.0, pos)
-        self.seek_to = self.position
+            pos = min(pos, max(0.0, self.duration - 1.0 / self.fps))
+        self.position = pos
+        self.seek_to = pos
 
     @staticmethod
     def pet_key(code):
@@ -446,7 +491,7 @@ class LiveSource:
         unknown key."""
         m = self.matchers[80]
         if self.menu is not None:
-            if k in ("h", "H"):
+            if k == "h":
                 return "toggle"
             return None                 # the search field takes the input
         if k == "b":
@@ -461,9 +506,9 @@ class LiveSource:
             m.gamma = min(5.0, m.gamma + 0.1)
         elif k == "G":
             m.gamma = max(0.1, m.gamma - 0.1)
-        elif k in ("d", "D"):
+        elif k == "d":
             m.dither = (int(m.dither) + 1) % len(m.DITHER_MODES)
-        elif k in ("z", "Z"):
+        elif k == "z":
             import convert
             modes = convert.ZOOM_MODES
             self.zoom = modes[(modes.index(self.zoom) + 1) % len(modes)]
@@ -494,14 +539,18 @@ class LiveSource:
             self.position = 0.0
             self.seek_to = 0.0
             return "status"
-        elif k in (" ", "p", "P"):
+        elif k == " ":
             self.paused = not self.paused
             return "status"
-        elif k in ("r", "R"):
+        elif k == "r":
+            # all settings back to the command line values
             self.apply_settings(self.start_settings)
             self.settings_version += 1
+            if self.zoom != self.start_zoom:
+                self.zoom = self.start_zoom
+                self.seek_to = self.seek_to if self.seek_to is not None else self.position
             return "status"
-        elif k in ("h", "H"):
+        elif k == "h":
             return "toggle"
         else:
             return None
@@ -520,38 +569,44 @@ class LiveSource:
             m.gamma, m.dither = st["gamma"], st["dither"]
 
     def status_items(self):
+        """Groups of settings, each on its own rows, R)ESET last: it resets
+        all of them. A value that changes its width is padded to its widest
+        form, so that the items stay in place."""
         m = self.matchers[80]
-        return [f"B)RIGHTNESS {m.brightness:+.2f}",
-                f"C)ONTRAST {m.contrast:.1f}",
-                f"G)AMMA {m.gamma:.1f}",
-                f"D)ITHER {m.DITHER_MODES[int(m.dither) % len(m.DITHER_MODES)].upper()}",
-                "R)ESET", f"Z)OOM {self.zoom.upper()}"] + (["P)AUSED"] if self.paused else [])
+        return [[f"B)RIGHTNESS:{m.brightness:+.2f}",
+                 f"C)ONTRAST:{m.contrast:.1f}",
+                 f"G)AMMA:{m.gamma:.1f}",
+                 f"D)ITHER:{'ON' if int(m.dither) else 'OFF'}"],
+                [f"Z)OOM:{self.zoom.upper():<7}",
+                 "R)ESET"]]
 
-    KEY_ITEMS = ["1/2: BACK 1MIN/10S",
-                 "3/4: FWD 10S/1MIN", "5/6: FRAME BACK/FWD", "!: REWIND TO START", "SPACE: PAUSE",
+    # hotkeys as KEY)WHAT IT DOES, like the settings
+    KEY_ITEMS = ["1)BACK 1MIN", "2)BACK 10S", "3)FWD 10S", "4)FWD 1MIN",
+                 "5)FRAME BACK", "6)FRAME FWD", "!)REWIND", "@PAUSE",
                  "@LOOP",
-                 "S)EARCH YOUTUBE", "H)ELP AND STATUS",
-                 "RUNSTOP: QUIT"]
+                 "S)EARCH YOUTUBE", "H)ELP", "RUNSTOP)QUIT"]
 
     def loop_help(self):
-        mark = lambda t: clock(t) if t is not None else "NONE"
-        return [f"LOOP: 8 START ({mark(self.loop_start)})",
-                f"9 END ({mark(self.loop_end)})", "0 GO TO START", "7 CLEAR"]
+        # the marks are padded to the widest time, "(1:23:45)", for the same reason
+        mark = lambda t: f"({clock(t) if t is not None else 'NONE'})".ljust(9)
+        return [f"8)LOOP START {mark(self.loop_start)}",
+                f"9)LOOP END {mark(self.loop_end)}", "0)GO TO LOOP START", "7)CLEAR LOOP"]
 
     def overlay_lines(self, cols):
-        """Settings and hotkeys for the PET, packed into lines of `cols`."""
-        lines, line = [], ""
+        """Settings, then hotkeys from a new line, packed into lines of
+        `cols`, then the timeline."""
         keys = []
         for i in self.KEY_ITEMS:
-            keys += self.loop_help() if i == "@LOOP" else [i]
-        for item in self.status_items() + keys:
-            if line and len(line) + 2 + len(item) > cols - 1:
-                lines.append(line)
-                line = item
+            if i == "@PAUSE":
+                keys.append(f"SPACE)PAUSE:{'ON' if self.paused else 'OFF':<3}")
+            elif i == "@LOOP":
+                keys += self.loop_help()
             else:
-                line = f"{line}  {item}" if line else item
-        if line:
-            lines.append(line)
+                keys.append(i)
+        lines = []
+        for group in self.status_items() + [keys]:
+            lines += pack(group, cols - 1)
+        lines = [l.rstrip() for l in lines]
         if self.duration:
             lines.append(self.timeline(cols - 1))
         return lines
@@ -578,7 +633,8 @@ class LiveSource:
     def status_text(self):
         """The settings for the terminal, like "B)rightness +0.05"."""
         out = []
-        for item in self.status_items():
+        for item in sum(self.status_items(), []) + (["paused"] if self.paused else []):
+            item = item.rstrip()
             out.append(item[:2] + item[2:].lower() if item[1] == ")" else item.lower())
         if self.loop_start is not None or self.loop_end is not None:
             mark = lambda t: clock(t) if t is not None else "none"
@@ -589,8 +645,8 @@ class LiveSource:
 class Stream:
     """The virtual VIDEO80.SEQ or VIDEO40.SEQ. Every OPEN on the PET reads from offset 0, which
     starts a new session: a key frame, then delta frames of whatever frame is
-    due at that moment. When no new frame is due, the rest of the block is
-    padding, so the PET gets each frame as soon as possible."""
+    due at that moment. When no new frame is due, the rest of the block is padding, so the PET
+    gets each frame as soon as possible."""
 
     KEEP = 65536     # bytes kept behind the newest request, for re-reads
 
@@ -624,7 +680,7 @@ class Stream:
     def reset(self):
         self.base = 0                # stream offset of buf[0]
         self.buf = bytearray()
-        self.prev = None
+        self.prev = None             # the frame the PET shows now
         self.last_index = None
         self.frames_sent = 0
         self.bytes_frames = 0
@@ -651,15 +707,14 @@ class Stream:
             if index == self.last_index:
                 self.buf += bytes([PAD]) * (end - self.base - len(self.buf))
                 break
-            frame = (bytes([KEY]) + codes if self.prev is None
-                     else encode_delta(self.prev, codes))
+            frame = encode_frame(self.prev, codes)
             self.buf += frame
             self.prev = codes
             self.last_codes = codes
             self.last_index = index
             self.frames_sent += 1
             self.bytes_frames += len(frame)
-            self.stats.frame(len(frame))
+            self.stats.frame(len(frame), 1 + len(codes))
         lo = max(0, start - self.base)
         out = bytes(self.buf[lo:end - self.base])
         drop = start - self.base - self.KEEP
@@ -740,6 +795,7 @@ class Stats:
         self.gaps = collections.deque()      # (time, ms)
         self.frames = collections.deque()    # (time, bytes)
         self.blocks = collections.deque()    # (time, bytes)
+        self.last_frame = None               # (bytes sent, bytes of a full frame)
         self.last_print = time.monotonic()
 
     def _add(self, q, v):
@@ -754,8 +810,11 @@ class Stats:
     def block(self, n):
         self._add(self.blocks, n)
 
-    def frame(self, n):
-        self._add(self.frames, n)
+    def frame(self, sent, full):
+        """sent: bytes of the frame as sent; full: bytes of a plain key
+        frame, which has all screen codes."""
+        self._add(self.frames, sent)
+        self.last_frame = (sent, full)
 
     def summary(self):
         now = time.monotonic()
@@ -763,8 +822,21 @@ class Stats:
         fr = [v for t, v in self.frames if t >= cut]
         bl = [v for t, v in self.blocks if t >= cut]
         gp = [v for t, v in self.gaps if t >= cut]
-        return {"fps": len(fr) / self.WINDOW, "kbs": sum(bl) / self.WINDOW / 1024,
-                "frames": spread(fr), "gaps": spread(gp), "active": bool(bl)}
+        # frames in each of the last whole seconds: the slowest and the fastest
+        per_second = [sum(1 for t, _ in self.frames if now - s - 1 <= t < now - s)
+                      for s in range(int(self.WINDOW))]
+        return {"fps": len(fr) / self.WINDOW, "fps_range": f"{min(per_second)}/{max(per_second)}",
+                "kbs": sum(bl) / self.WINDOW / 1024,
+                "frames": spread(fr), "gaps": spread(gp), "active": bool(bl),
+                "last": self.last_frame_text()}
+
+    def last_frame_text(self):
+        """The last frame against a full frame: "last frame 231 B of
+        2001 B (12%)"."""
+        if self.last_frame is None:
+            return ""
+        sent, full = self.last_frame
+        return f"last frame {sent} B of {full} B ({100 * sent / full:.0f}%)"
 
     def maybe_print(self):
         """Without the terminal view: a summary line every WINDOW seconds."""
@@ -774,9 +846,9 @@ class Stats:
         self.last_print = now
         st = self.summary()
         if st["active"]:
-            say(f"{st['fps']:4.1f} fps  {st['kbs']:4.2f} KB/s  "
+            say(f"{st['fps']:4.1f} fps (min/max {st['fps_range']})  {st['kbs']:4.2f} KB/s  "
                 f"frame bytes min/p90/max {st['frames']}  "
-                f"request gap ms {st['gaps']}")
+                f"request gap ms {st['gaps']}  {st['last']}")
 
 
 def pack(items, width):
@@ -867,9 +939,11 @@ class Display:
                        "lowercase b/c/g up, uppercase down",
                        "s: YouTube search here", "Ctrl-C quits"], w)
         if st["active"]:
-            server += pack([f"{st['fps']:4.1f} fps", f"{st['kbs']:4.2f} KB/s",
+            server += pack([f"{st['fps']:4.1f} fps (min/max {st['fps_range']})",
+                            f"{st['kbs']:4.2f} KB/s",
                             f"frame bytes min/p90/max {st['frames']}",
                             f"request gap ms {st['gaps']}", "(last 5 s)"], w)
+            server += pack([st["last"]], w)
         else:
             server.append("waiting for the PET to read the video"[:w])
         with self.lock:
@@ -924,7 +998,7 @@ class TerminalKeys:
                 elif len(key) == 1 and key >= " ":
                     self.typing += key
                 continue
-            if key in ("s", "S"):
+            if key == "s":
                 self.typing = ""
                 stream.source.show_results()
                 continue
@@ -1187,8 +1261,8 @@ def main():
     ap.add_argument("--brightness", type=float, default=0.0, help="-1..1, default 0")
     ap.add_argument("--contrast", type=float, default=1.0, help="default 1")
     ap.add_argument("--gamma", type=float, default=1.0, help="default 1")
-    ap.add_argument("--dither", type=int, default=0,
-                    help="0 none (default), 1 Floyd-Steinberg, 2 ordered")
+    ap.add_argument("--dither", type=int, default=0, choices=(0, 1),
+                    help="0 none (default), 1 Floyd-Steinberg")
     ap.add_argument("--stick", type=float, default=6.0,
                     help="keep a cell's previous glyph if it is at most this many "
                          "pixels worse; fewer changes per frame (default 6, 0 = off)")
@@ -1219,7 +1293,7 @@ def main():
             say(f"could not restore stream state: {e}")
     say(stream.source.status_text())
     if DISPLAY is None and keys.fd is not None:
-        say("keys: b/B brightness, c/C contrast, g/G gamma, d dither, r reset b/c/g/d, "
+        say("keys: b/B brightness, c/C contrast, g/G gamma, d dither, z zoom, r reset b/c/g/d/z, "
             "1/2/3/4 seek -60/-10/+10/+60 s, 5/6 frame -1/+1, ! rewind to start, space pause, s search, "
             "h toggle status/help on the PET (lowercase up, uppercase down)")
     try:

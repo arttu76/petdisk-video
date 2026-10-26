@@ -204,9 +204,7 @@ class Matcher:
         return n * 255.0
 
     STICK_RATIO = 0.5
-    DITHER_MODES = ("none", "floyd-steinberg", "ordered")
-    BAYER4 = (np.array([[0, 8, 2, 10], [12, 4, 14, 6],
-                        [3, 11, 1, 9], [15, 7, 13, 5]], dtype=np.float32) + 0.5) / 16.0
+    DITHER_MODES = ("none", "floyd-steinberg")
 
     def prepare(self, gray):
         """gray: (height, width) uint8 -> float32 target pixels 0..255."""
@@ -215,10 +213,6 @@ class Matcher:
         if mode == "floyd-steinberg":
             img = Image.fromarray(np.clip(g, 0, 255).astype(np.uint8), "L")
             g = np.asarray(img.convert("1"), dtype=np.float32) * 255.0
-        elif mode == "ordered":
-            h, w = g.shape
-            t = np.tile(self.BAYER4, (h // 4, w // 4)) * 255.0
-            g = np.where(g > t, 255.0, 0.0).astype(np.float32)
         return g
 
     def codes_for(self, gray, prev=None):

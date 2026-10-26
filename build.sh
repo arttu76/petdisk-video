@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 mkdir -p serve build
 
 one() {  # one <device> <columns> <program name> <video file> <output> <results file>
-    sed -e "s/@DEV@/$1/" -e "s/@NAME@/$3/" -e "s/@VIDEO@/$4/" -e "s/@RESULTS@/$6/" -e "/^#/d" stub.bas.in > build/stub.bas
+    sed -e "s/@DEV@/$1/" -e "s/@COLS@/$2/" -e "s/@NAME@/$3/" -e "s/@VIDEO@/$4/" -e "s/@RESULTS@/$6/" -e "/^#/d" stub.bas.in > build/stub.bas
     petcat -w2 -l 0401 -o build/stub.prg -- build/stub.bas
     acme -DDEV=$1 -DCOLS=$2 -f plain -o build/ml.bin client.a
     python3 - "$5" <<'PY'
