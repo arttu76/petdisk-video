@@ -1,6 +1,7 @@
 """LiveSource without its decoder thread: hotkeys, settings, seeking, loop
 marks, the overlay text on the PET and the YouTube search screen."""
 
+import os
 import re
 import time
 import unittest
@@ -269,6 +270,58 @@ class DecoderTest(unittest.TestCase):
             if time.monotonic() > deadline:
                 raise AssertionError("the decoder did not get there")
             time.sleep(0.01)
+
+
+class TerminalSearchTest(unittest.TestCase):
+    """The search field in the server terminal: S, then text and RETURN."""
+
+    def setUp(self):
+        patcher = mock.patch.object(convert, "youtube_search",
+                                    lambda q, c=9: SearchTest.RESULTS[:c])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.src = live_source()
+        self.stream = server.Stream(self.src)
+        r, self.w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, self.w)
+        self.keys = server.TerminalKeys.__new__(server.TerminalKeys)
+        self.keys.fd, self.keys.typing = r, None
+
+    def type(self, text):
+        os.write(self.w, text.encode())
+        self.keys.poll(self.stream)
+        self.assertTrue(self.src.search_done.wait(5))
+
+    def test_the_field_stays_open_after_a_search(self):
+        self.type("s")
+        self.assertEqual(self.keys.typing, "")
+        self.type("pet demos\r")
+        self.assertEqual(self.src.query, "pet demos")
+        self.assertEqual(self.keys.typing, "")       # ready for a number, N or P
+        self.type("n\r")
+        self.assertEqual(self.src.page, 1)
+        self.assertEqual(self.keys.typing, "")
+        self.type("99\r")                           # no such result
+        self.assertEqual(self.keys.typing, "")
+        self.type("23\r")
+        self.assertEqual(self.src.url, SearchTest.RESULTS[22][2])
+        self.assertIsNone(self.keys.typing)          # the video plays
+
+    def test_empty_entry_goes_back_to_the_video(self):
+        self.src.url = "https://example.com/v"
+        self.type("s")
+        self.type("\r")
+        self.assertIsNone(self.src.menu)
+        self.assertIsNone(self.keys.typing)
+
+    def test_escape_closes_the_field(self):
+        self.src.url = "https://example.com/v"
+        self.type("s")
+        self.type("pet\r")
+        self.type("\x1b")
+        self.assertIsNone(self.keys.typing)
+        self.assertIsNone(self.src.menu)
 
 
 class OverlayTextTest(unittest.TestCase):

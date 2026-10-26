@@ -988,8 +988,11 @@ class TerminalKeys:
         for key in self.split_keys(data):
             if self.typing is not None:
                 if key in ("\r", "\n"):
-                    text, self.typing = self.typing.strip(), None
-                    stream.source.entry(text)
+                    stream.source.entry(self.typing.strip())
+                    # after a search or a page turn the results show: go on
+                    # typing a number, N or P. A picked video or an empty
+                    # entry closes the search screen, and the field with it.
+                    self.typing = "" if stream.source.menu is not None else None
                 elif key == "\x1b":
                     self.typing = None
                     stream.source.close_results()

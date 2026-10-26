@@ -223,6 +223,8 @@ Press S on the PET. The PET shows the results of the last search, 20 to a page, 
 
 While the server searches, asks YouTube for more results or opens a video, the top row of the PET screen says so.
 
+The search also works in the server terminal. Press S, type the same entries in the field below the frame, and press RETURN after each entry. The field stays open until a video starts or an empty entry goes back to the video. ESC closes the field.
+
 ## The server terminal
 
 In a terminal, the server shows a full-screen view:
