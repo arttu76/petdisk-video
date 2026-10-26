@@ -315,6 +315,18 @@ class TerminalSearchTest(unittest.TestCase):
         self.assertIsNone(self.src.menu)
         self.assertIsNone(self.keys.typing)
 
+    def test_terminal_view_shows_the_results(self):
+        # the PET does not read the video stream during a search, so the
+        # terminal view must not show the frame sent last
+        self.stream.last_codes = bytes([160]) * 2000
+        self.type("s")
+        self.type("pet demos\r")
+        screen = self.stream.terminal_codes()
+        self.assertEqual(screen, server.text_screen(self.src.results_lines(80)[:23], 80))
+        self.assertIn(bytes(server.screen_code(c) for c in "YOUTUBE: PET DEMOS"), screen)
+        self.type("1\r")                            # a video plays: its frames again
+        self.assertEqual(self.stream.terminal_codes(), bytes([160]) * 2000)
+
     def test_escape_closes_the_field(self):
         self.src.url = "https://example.com/v"
         self.type("s")

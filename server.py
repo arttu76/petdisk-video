@@ -677,6 +677,15 @@ class Stream:
             out[row * self.cols:(row + 1) * self.cols] = bytes(screen_code(ch) for ch in line)
         return bytes(out)
 
+    def terminal_codes(self):
+        """The screen for the terminal view: the search screen while it
+        shows, with the rows of the RESULTS file, else the frame sent last.
+        During a search the PET does not read the video stream, so the
+        frame sent last would be an old video frame."""
+        if self.source.menu is not None:
+            return text_screen(self.source.results_lines(self.cols)[:23], self.cols)
+        return self.last_codes
+
     def reset(self):
         self.base = 0                # stream offset of buf[0]
         self.buf = bytearray()
@@ -873,6 +882,7 @@ class Display:
 
     GREEN, INV, NOINV, RESET = "\x1b[32m", "\x1b[7m", "\x1b[27m", "\x1b[0m"
     GREY = "\x1b[90m"                  # server-only text
+    YELLOW = "\x1b[33m"                # the search field, easy to find
     BORDER = "\x1b[38;5;238m"          # dark grey frame border
 
     def __init__(self):
@@ -919,7 +929,7 @@ class Display:
         width = shutil.get_terminal_size((100, 40)).columns
         st = stream.stats.summary()
         src = stream.source
-        box = self.frame_lines(stream.last_codes, stream.cols, width)
+        box = self.frame_lines(stream.terminal_codes(), stream.cols, width)
         w = min(width, stream.cols + 2)        # text no wider than the frame box
         if src.menu is not None:
             now_playing = "Now: YouTube search"
@@ -930,7 +940,8 @@ class Display:
         lines = [f"PETdisk Video ({stream.cols} cols)  {now_playing}"[:w]]
         lines += box
         if keys is not None and keys.typing is not None:
-            lines.append(f"number, N/P page or search words: {keys.typing}_"[:w])
+            field = f"number, N/P page or search words: {keys.typing}_"[:w]
+            lines.append(f"{self.YELLOW}{field}{self.RESET}")
         # the same settings, help and timeline lines as on the PET
         lines += src.overlay_lines(w + 1)
         # what only the server shows, in grey
