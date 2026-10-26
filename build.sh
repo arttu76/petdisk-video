@@ -17,7 +17,7 @@ import sys
 stub = open("build/stub.prg", "rb").read()
 ml = open("build/ml.bin", "rb").read()
 end = 0x0401 + len(stub) - 2
-if end > 0x07ff:
+if end > 0x07fe:                # $07FE-$07FF: SRVSTOP and KEYOUT of client.a
     sys.exit("BASIC part too long: ends at $%04X" % end)
 data = stub + bytes(0x0800 - end) + ml
 open(sys.argv[1], "wb").write(data)

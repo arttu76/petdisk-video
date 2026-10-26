@@ -250,7 +250,7 @@ class DecoderTest(unittest.TestCase):
 
         ms = {cols: convert.Matcher(cols) for cols in (80, 40)}
         with mock.patch.object(convert, "gray_frames", fake_frames), \
-                mock.patch.object(convert, "resolve", lambda url, log=None: (url, 100.0)):
+                mock.patch.object(convert, "resolve", lambda url, log=None, audio=False: (url, 100.0)):
             src = server.LiveSource("clip.mp4", ms, 10.0)
             try:
                 self.wait(lambda: src.count > 3)
@@ -275,8 +275,9 @@ class DecoderTest(unittest.TestCase):
     def test_waiting_decoder_counts_down_and_stops_for_a_new_video(self):
         calls = []
 
-        def no_video(url, log=None):
-            calls.append(url)
+        def no_video(url, log=None, audio=False):
+            if not audio:                       # the sound prefetch does not count
+                calls.append(url)
             return None, None
 
         ms = {cols: convert.Matcher(cols) for cols in (80, 40)}

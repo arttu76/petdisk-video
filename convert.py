@@ -318,6 +318,9 @@ def _js_runtime_args():
 YTDLP_FORMAT = ("bv*[height<=360][vcodec^=avc1][protocol^=http]/"
                 "bv*[height<=360][protocol^=http]/b[height<=360]/"
                 "bv*[height<=480][protocol^=http]/b")
+# For audio mode: the sound only. The video formats above have no sound on
+# YouTube, where video and audio are separate streams.
+YTDLP_AUDIO_FORMAT = "ba[protocol^=http]/ba/b[protocol^=http]/b"
 
 
 def is_url(source):
@@ -332,9 +335,10 @@ class Media(str):
         return obj
 
 
-def resolve(source, log=None):
+def resolve(source, log=None, audio=False):
     """(media URL or file name, duration in seconds or None). For a web page
-    URL, yt-dlp finds the direct media URL, which ffmpeg can seek in."""
+    URL, yt-dlp finds the direct media URL, which ffmpeg can seek in: the
+    video stream, or with audio=True the sound stream."""
     if not is_url(source):
         try:
             out = subprocess.run(
@@ -348,7 +352,7 @@ def resolve(source, log=None):
         raise SystemExit("yt-dlp not found")
     res = subprocess.run(
         ["yt-dlp", "-q", "--no-warnings"] + _js_runtime_args() +
-        ["-f", YTDLP_FORMAT, "-O", "duration", "-O", "%(http_headers)j",
+        ["-f", YTDLP_AUDIO_FORMAT if audio else YTDLP_FORMAT, "-O", "duration", "-O", "%(http_headers)j",
          "-O", "urls", source],
         capture_output=True, text=True, timeout=120)
     if log and res.stderr.strip():
@@ -422,3 +426,129 @@ def gray_frames(source, fps, width, height, stretch=False, max_frames=None,
     finally:
         ff.kill()
         ff.wait()
+
+
+# ---- audio for the PET: 1-bit sound through the VIA shift register
+
+AUDIO_FILTER = "highpass=f=150,lowpass=f=4500,dynaudnorm=f=150:g=15"
+PDM_GAIN = 0.6           # a second-order modulator is stable below about 0.7
+
+
+class PDM:
+    """Second-order delta-sigma modulator: float samples -1..1 in, one bit
+    per sample out, packed 8 to a byte with the first bit in bit 7 (the
+    VIA shifts bit 7 out first). The state goes on from call to call."""
+
+    def __init__(self):
+        self.i1 = self.i2 = 0.0
+        self.y = 1.0
+
+    def bytes(self, samples):
+        i1, i2, y = self.i1, self.i2, self.y
+        bits = np.empty(len(samples), dtype=np.uint8)
+        for n, x in enumerate((samples * PDM_GAIN).tolist()):
+            i1 += x - y
+            i2 += i1 - y
+            y = 1.0 if i2 >= 0.0 else -1.0
+            bits[n] = y > 0
+        self.i1, self.i2, self.y = i1, i2, y
+        return np.packbits(bits).tobytes()
+
+
+class Clip:
+    """Clipped 1-bit sound: the bit is the sign of the sound, so a tone
+    becomes a square wave of the same pitch. Unlike PDM, which needs a
+    speaker that plays low frequencies, the harmonics of the square wave
+    make the pitch audible on a small beeper too. A Schmitt trigger
+    (GATE) keeps quiet parts silent instead of turning noise into hiss.
+    The state goes on from call to call."""
+
+    GATE = 0.03
+
+    def __init__(self):
+        self.y = 0
+
+    def bytes(self, samples):
+        state = np.full(len(samples), -1, dtype=np.int8)
+        state[samples > self.GATE] = 1
+        state[samples < -self.GATE] = 0
+        # inside the gate the bit stays as it was: carry the last decision on
+        known = np.where(state >= 0, np.arange(len(samples)), -1)
+        last = np.maximum.accumulate(known)
+        bits = np.where(last >= 0, state[np.maximum(last, 0)], self.y).astype(np.uint8)
+        if len(bits):
+            self.y = int(bits[-1])
+        return np.packbits(bits).tobytes()
+
+
+AUDIO_METHODS = {"clip": Clip, "pdm": PDM}
+
+
+class AudioStream:
+    """The sound of a file or a media URL as 1-bit audio bytes for the PET,
+    from position `start`: ffmpeg decodes it to `rate` samples per second,
+    one sample for each bit, and `method` (clip or pdm) makes the bits. At
+    the end of the media it starts again at `loop_start`. samples(n) returns
+    the sound for n bytes, encode() makes the bytes of it, read(n) does
+    both. pos is the position in seconds of the next sample."""
+
+    def __init__(self, media, start, rate, log=None, loop_start=0.0, method="clip"):
+        self.media, self.rate, self.log, self.loop_start = media, rate, log, loop_start
+        self.pdm = AUDIO_METHODS[method]()
+        self.ff = None
+        self.open(start)
+
+    def open(self, start):
+        self.close()
+        self.pos = start
+        headers = getattr(self.media, "headers", None)
+        hdr = (["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+               if headers else [])
+        cmd = (["ffmpeg", "-v", "error", "-nostdin"] + hdr +
+               (["-ss", f"{start:.2f}"] if start > 0 else []) +
+               ["-i", self.media, "-vn", "-ac", "1", "-ar", str(self.rate),
+                "-af", AUDIO_FILTER, "-f", "s16le", "pipe:1"])
+        err = subprocess.PIPE if self.log else subprocess.DEVNULL
+        self.ff = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        if self.log:
+            _pipe_lines(self.ff.stderr, self.log)
+
+    def samples(self, n):
+        """Float samples -1..1 for n bytes: 8 a byte."""
+        want = n * 8 * 2                        # 2 bytes a sample
+        pcm = b""
+        restarts = 0
+        while len(pcm) < want:
+            chunk = self.ff.stdout.read(want - len(pcm))
+            if chunk:
+                pcm += chunk
+                self.pos += len(chunk) / 2 / self.rate
+                continue
+            restarts += 1                       # the end: loop, or silence if nothing plays
+            if restarts > 2:
+                pcm += b"\0" * (want - len(pcm))
+                break
+            self.open(self.loop_start)
+        return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+    def encode(self, samples):
+        return self.pdm.bytes(samples)
+
+    def read(self, n):
+        return self.encode(self.samples(n))
+
+    def close(self):
+        if self.ff is not None:
+            self.ff.kill()
+            self.ff.wait()
+            self.ff = None
+
+
+class Silence:
+    """Audio bytes with no sound: all bits 0, so CB2 does not move."""
+
+    def read(self, n):
+        return bytes(n)
+
+    def close(self):
+        pass

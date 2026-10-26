@@ -16,15 +16,29 @@
 # @COLS@-1 characters: the header is at most that long, and the last column
 # would wrap the line.
 #
+# Line 12 moves the top of BASIC memory (MEMSIZ, $34-$35) to $1000, so that
+# the strings stay below the video frame buffer at $1000 and the audio ring
+# buffer at $1800-$3FFF, also on a 16 KB PET. CLR applies it. The old value
+# waits in the second tape buffer (826-827), and line 30 puts it back when
+# PDV ends, so BASIC has all its memory again.
+#
+# The server stops (Ctrl+C): the machine code returns with 2046 set, or the
+# PICK file holds "2" (line 135). Lines 400-410 clear the screen and print
+# the message, then RUN two rows lower, and put the cursor on row 0: END
+# prints a RETURN and READY. on row 1, so the cursor ends on RUN, and the
+# user only presses RETURN. The message has 39 characters: it fits a
+# 40-column row.
+#
 # Lines 120-136: while the search screen waits for keys, the PET asks the
 # server every 2.5 seconds (150 jiffies of TI) whether the search screen was
 # closed on the server, for example by a video picked in the server
 # terminal. The file PICK then holds "1", and the PET starts the video. TI
 # wraps at midnight, so a TI smaller than T also starts a check.
 10 poke59468,12:ifpeek(65488)=21thenprintchr$(142);
-15 d=@DEV@:k=0
+12 poke826,peek(52):poke827,peek(53):poke52,0:poke53,16:clr
+15 d=@DEV@:k=0:poke2046,0
 20 open2,d,2,"@VIDEO@,s,r":sys2048:close2:k=peek(2047)
-30 ifk=0thenprint"{clr}":end
+30 ifk=0then400
 40 ifk=83then100
 50 open3,d,3,"k"+mid$(str$(k),2):close3:goto20
 100 open4,d,4,"@RESULTS@,s,r":sys2051:close4:ifpeek(2047)=0then30
@@ -33,6 +47,7 @@
 130 geta$:ifa$<>""then140
 132 ifti-t<150andti>=tthen130
 134 t=ti:open3,d,3,"pick,s,r":get#3,a$:close3:ifa$="1"then20
+135 ifa$="2"thenpoke2046,1:goto400
 136 goto130
 140 ifa$=chr$(13)then200
 150 ifa$=chr$(20)andlen(q$)>0thenq$=left$(q$,len(q$)-1):printa$;:goto130
@@ -46,3 +61,5 @@
 250 m$="searching...":gosub300:fori=1tolen(q$)step15:open3,d,3,"q"+mid$(q$,i,15):close3:next
 260 open3,d,3,"q":close3:goto100
 300 print"{home}"m$;:fori=1to@COLS@-1-len(m$):print" ";:next:return
+400 print"{clr}";:ifpeek(2046)thenprint"server stopped. type run to start again":print:print"run{home}";
+410 poke52,peek(826):poke53,peek(827):clr:end

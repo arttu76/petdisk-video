@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +29,9 @@ class StreamError(AssertionError):
 
 def decode(data, cells, screen=None):
     """Decode stream bytes like the PET client: [(marker, screen)] for each
-    complete frame, ("search", screen) for the $FC marker. A frame cut off at
+    complete frame, ("search", screen) for the $FC marker, ("audio",
+    screen) for the $FA marker, after which only sound follows, and
+    ("stopped", screen) for the $F9 marker. A frame cut off at
     the end of data is left out. Unlike the client, which skips unknown
     bytes and drops broken frames, this raises StreamError."""
     frames = []
@@ -42,6 +45,12 @@ def decode(data, cells, screen=None):
             frames.append(("search", screen))
             i += 1
             continue
+        if m == server.AUDIO:
+            frames.append(("audio", screen))   # the rest is sound
+            break
+        if m == server.STOPPED:
+            frames.append(("stopped", screen))  # the server stops
+            break
         try:
             if m == server.KEY:
                 if i + 1 + cells > n:
@@ -135,6 +144,11 @@ class FakeSource:
         self.count = 0
         self.url = url
         self.paused = False
+        self.audio = False
+        self.media = None            # what get_media() returns in audio mode
+        self.latest = self.codes
+        self.ready = threading.Event()   # a frame exists
+        self.ready.set()
         self.menu = None
         self.results = []
         self.position = 0.0
@@ -145,8 +159,20 @@ class FakeSource:
         self.settings_applied = None
 
     def show(self, codes):
-        self.codes = codes
+        self.codes = self.latest = codes
         self.count += 1
+
+    def get_media(self, audio=False):
+        return self.media
+
+    still_picture = None             # what still() returns
+    still_calls = None
+
+    def still(self, at, cols):
+        if self.still_calls is None:
+            self.still_calls = []
+        self.still_calls.append(at)
+        return self.still_picture
 
     def current(self, t0):
         return self.count, self.codes

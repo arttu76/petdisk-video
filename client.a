@@ -22,6 +22,7 @@ STOP   = $ffe1
 ; calls this code. It returns when a key is pressed: KEYOUT holds the key,
 ; 0 for STOP. BASIC then sends the key to the server and reopens the video.
 KEYOUT = ML - 1
+SRVSTOP = ML - 2                        ; 1: the server stopped
 KBCOUNT = $9e                           ; keys in the keyboard buffer
 KBBUF   = $026f                         ; keyboard buffer
 
@@ -32,6 +33,10 @@ KBBUF   = $026f                         ; keyboard buffer
 ;                                       delta frame: skip cells, then copy
 ;   $FD                                 padding, ignored
 ;   $FC                                 nothing to play: go to the search
+;   $FA + audio bytes...                audio mode: 1-bit sound until a key,
+;                                       see the audio player below
+;   $F9                                 the server stops: back to BASIC with
+;                                       SRVSTOP set, BASIC ends PDV
 ;   $FB + (control, codes)...           run-length key frame, until FRAME
 ;                                       cells: control 0-127 is followed by
 ;                                       control + 1 literal codes, 128-255
@@ -42,6 +47,10 @@ KEY   = $ff
 DELTA = $fe
 SEARCH = $fc
 RLE   = $fb
+AUDIO = $fa
+STOPPED = $f9
+LEAVE = $ff                             ; audio mode, at a packet start: back
+                                        ; to video frames
 
 ; IEEE-488 lines, as used by the BASIC 4 kernal byte-read routine at $F1C0
 VIAPB  = $e840                          ; bit 1 NRFD out, bit 7 DAV in
@@ -141,6 +150,14 @@ next    lda KBCOUNT                     ; a key pressed?
 +       cmp #RLE
         bne +
         jmp rle
++       cmp #AUDIO
+        bne +
+        jmp audio
++       cmp #STOPPED
+        bne +
+        lda #1
+        sta SRVSTOP
+        jmp exit
 +       cmp #SEARCH
         bne next                        ; padding or junk
         lda #83                         ; nothing to play: act as if S
@@ -292,6 +309,365 @@ chkstop jsr STOP
         pla
         jmp exit
 
+; ---- audio player. After $FA the stream is packets of 512 bytes: DISP
+; display bytes (TEXTW screen codes of the time or BUFFERING for the
+; title on row 0, then a
+; picture block of PICB bytes for the slide show), then sound: 8 bits a byte, bit 7 first, each bit
+; 2 * (T2RATE + 2) cycles on CB2, which drives the speaker. The
+; VIA shift register shifts the bits out under T2 control and sets IFR
+; bit 2 when a byte is out; then the next byte goes in. A ring buffer
+; covers the pauses of the PETdisk. Interrupts are off while the sound
+; plays, so the 60 Hz keyboard interrupt cannot stop the shift register;
+; the keyboard matrix is checked directly instead. When a key is down,
+; the sound stops, interrupts go on, and the kernal reads the key.
+VIASR  = $e84a
+VIAACR = $e84b
+VIAIFR = $e84d
+VIAT2L = $e848
+KBROW  = $e810                          ; PIA 1 port A: keyboard row 0-9
+KBCOL  = $e812                          ; PIA 1 port B: columns, 0 = down
+ABUF   = $1800                          ; ring buffer $1800-$3FFF; BASIC
+AEND   = $4000                          ; keeps its strings below $1000
+APAGES = (AEND - ABUF) / 256
+ASTART = 16                             ; pages buffered before the sound
+T2RATE = 19                             ; 42 cycles per bit: 23.8 kHz
+SILENT = $00                            ; CB2 stays low: no sound
+TEXTW  = 9                              ; the time or BUFFERING, on row 0
+PICB   = 16                             ; picture block: commands with
+                                        ; absolute positions, see dstep
+PICEND = $ff                            ; ends a picture block early
+DISP   = TEXTW + PICB                   ; display bytes at the packet start
+SOUND  = 512 - DISP                     ; sound bytes in a packet
+; the time field in the title "AUDIO MODE (1:23) - PRESS A FOR VIDEO"
+; ("AUDIO (1:23) - A: VIDEO" on 40 columns), which the server centers on
+; row 0: see AUDIO_TITLE in server.py
+!if COLS = 80 {
+TIMEX  = 31
+} else {
+TIMEX  = 13
+}
+
+audio   lda #<ABUF
+        sta ard+1
+        sta awr+1
+        lda #>ABUF
+        sta ard+2
+        sta awr+2
+        lda #0
+        sta acnt
+        sta acnt+1
+        sta aplay
+        sta apos
+        sta apos+1
+        sta dnew
+        sta dphase
+        sta pcnt
+aresume sei
+        lda VIAACR
+        sta oldacr
+        and #$e3
+        ora #$14                        ; shift out under T2 control
+        sta VIAACR
+        lda #T2RATE
+        sta VIAT2L
+        lda #SILENT
+        sta VIASR                       ; start shifting
+        lda nrfdh
+        sta VIAPB                       ; NRFD high: ready for data
+
+aloop   lda VIAIFR                      ; 8 bits out?
+        and #$04
+        beq +
+        jsr afeed
++       lda dnew                        ; a new packet plays: show it
+        beq +
+        jsr dstart
++       lda dphase                      ; one small drawing step
+        beq +
+        jsr dstep
++       inc akeyt                       ; the keyboard now and then
+        bne +
+        jsr akeys
++       lda acnt+1                      ; room in the buffer?
+        cmp #APAGES - 1
+        bcs aloop                       ; no: the drive waits
+        bit VIAPB
+        bmi aloop                       ; DAV high: no data yet
+        lda nrfdl
+        sta VIAPB                       ; NRFD low
+        lda IEEEIN
+        eor #$ff
+        ldy awr+1                       ; a packet start? Packets are
+        bne +                           ; 512-aligned in the ring, and
+        tay                             ; ABUF is an even page
+        lda awr+2
+        lsr
+        tya
+        bcs +
+        cmp #LEAVE                      ; the server switched back to video
+        bne +
+        jmp aleave
++
+awr     sta ABUF                        ; address patched
+        ldy #$3c
+        sty PIACRA                      ; NDAC high: accepted
+        inc awr+1
+        bne +
+        inc awr+2
+        lda awr+2
+        cmp #>AEND
+        bne +
+        lda #>ABUF
+        sta awr+2
++       inc acnt
+        bne +
+        inc acnt+1
+-
++       lda VIAIFR                      ; feed the sound while DAV goes high
+        and #$04
+        beq +
+        jsr afeed
++       bit VIAPB
+        bpl -                           ; wait for DAV high
+        lda #$34
+        sta PIACRA                      ; NDAC low
+        lda nrfdh
+        sta VIAPB                       ; NRFD high: ready for the next byte
+        jmp aloop
+
+; back to video frames: finish the handshake, sound off, interrupts on;
+; the frames follow in the stream
+aleave  ldy #$3c
+        sty PIACRA                      ; NDAC high: accepted
+-       lda VIAPB
+        bpl -                           ; wait for DAV high
+        lda #$34
+        sta PIACRA                      ; NDAC low
+        lda oldacr
+        sta VIAACR                      ; sound off
+        cli
+        jmp next
+
+; the next byte into the shift register: from the buffer, or silence
+; until ASTART pages are buffered (at the start and after an underrun).
+; At a packet start, the display bytes are noted for the main loop and
+; skipped. Packets are 512-aligned in the ring, so DISP never crosses a
+; page.
+afeed   lda aplay
+        bne afplay
+        lda acnt+1
+        cmp #ASTART
+        bcs +
+        jmp asilent                     ; still filling the buffer
++       inc aplay
+afplay  lda apos
+        ora apos+1
+        bne asound
+        lda acnt+1                      ; a packet starts: DISP + 1 bytes?
+        bne +
+        lda acnt
+        cmp #DISP + 1
+        bcc aunder
++       lda ard+1
+        sta dptr
+        lda ard+2
+        sta dptr+1
+        lda ard+1
+        clc
+        adc #DISP
+        sta ard+1
+        sec
+        lda acnt
+        sbc #DISP
+        sta acnt
+        bcs +
+        dec acnt+1
++       lda #<SOUND
+        sta apos
+        lda #>SOUND
+        sta apos+1
+        lda #1
+        sta dnew
+asound  lda acnt
+        ora acnt+1
+        beq aunder
+ard     lda ABUF                        ; address patched
+        sta VIASR
+        inc ard+1
+        bne +
+        inc ard+2
+        lda ard+2
+        cmp #>AEND
+        bne +
+        lda #>ABUF
+        sta ard+2
++       lda acnt
+        bne +
+        dec acnt+1
++       dec acnt
+        lda apos
+        bne +
+        dec apos+1
++       dec apos
+        rts
+aunder  lda #0
+        sta aplay
+asilent lda #SILENT
+        sta VIASR
+        rts
+
+; any key down in the matrix? Feeds the sound between the rows.
+akeys   ldx #9
+-       lda VIAIFR
+        and #$04
+        beq +
+        jsr afeed
++       stx KBROW
+        lda KBCOL
+        cmp #$ff
+        bne akeydn
+        dex
+        bpl -
+        rts
+akeydn  pla                             ; drop the return address
+        pla
+        lda oldacr
+        sta VIAACR                      ; sound off
+        cli                             ; the kernal reads the key
+        ldx #0                          ; wait up to about 0.4 s
+        ldy #0
+-       lda KBCOUNT
+        bne akeyin
+        jsr STOP
+        bne +
+        jmp exit                        ; RUN/STOP
++       dex
+        bne -
+        dey
+        bne -
+        jmp aresume                     ; no key after all: play on
+akeyin  lda nrfdl
+        sta VIAPB                       ; NRFD low: not ready
+        lda KBBUF
+        sta KEYOUT
+        lda #0
+        sta KBCOUNT
+        jmp leave
+
+; ---- the display of a packet: the text, then the picture block, one
+; byte or one screen cell a step, each step short enough to feed the
+; shift register on time. A picture command (positions 0-2047):
+;   literal  (length - 1) << 3 | pos >> 8, pos & 255, length codes (1-14)
+;   repeat   $80 | pos >> 8, pos & 255, count (1-255), code
+dstart  lda #0
+        sta dnew
+        sta pidx
+        sta pcnt                        ; a block stands alone
+        lda dptr
+        sta dtime+1
+        clc
+        adc #TEXTW                      ; packets are 512-aligned: no carry
+        sta pblk+1
+        lda dptr+1
+        sta dtime+2
+        sta pblk+2
+        lda #1
+        sta dphase
+        rts
+
+dstep   lda dphase
+        cmp #1
+        bne dpic
+        ldx #TEXTW - 1
+dtime   lda $ffff,x                     ; address patched: the text
+        sta SCREEN + TIMEX,x
+        dex
+        bpl dtime
+        inc dphase
+        rts
+dpic    lda pcnt                        ; a command in progress: one cell
+        beq pnew
+        lda prep
+        bne +
+        jsr pbyte                       ; literal: the next code
+        jmp pcell
++       lda pcode                       ; repeat: the same code
+pcell   jsr pput
+        dec pcnt
+        rts
+pnew    lda pidx                        ; the next command of the block
+        cmp #PICB
+        bcs pdone
+        jsr pbyte
+        cmp #PICEND
+        beq pdone
+        sta phi
+        and #7
+        clc
+        adc #>SCREEN
+        sta pscr+1
+        jsr pbyte
+        sta pscr
+        lda phi
+        bmi prpt
+        lsr
+        lsr
+        lsr
+        clc
+        adc #1                          ; length 1-14
+        sta pcnt
+        lda #0
+        sta prep
+        rts
+prpt    jsr pbyte                       ; count
+        sta pcnt
+        jsr pbyte                       ; code
+        sta pcode
+        lda #1
+        sta prep
+        rts
+pdone   lda #0
+        sta dphase
+        rts
+
+; the next byte of the picture block into A
+pbyte   ldx pidx
+pblk    lda $ffff,x                     ; address patched
+        inc pidx
+        rts
+
+; A into the screen at pscr, if pscr is inside the screen; then pscr + 1
+pput    ldy pscr+1
+        cpy #>(SCREEN + FRAME)
+        bcc pok
+        bne pskip
+        ldy pscr
+        cpy #<(SCREEN + FRAME)
+        bcs pskip
+pok     ldy pscr
+        sty pw+1
+        ldy pscr+1
+        sty pw+2
+pw      sta $ffff                       ; address patched
+pskip   inc pscr
+        bne +
+        inc pscr+1
++       rts
+
+dptr    !word 0                         ; the display bytes of the packet
+dnew    !byte 0
+dphase  !byte 0                         ; 0 idle, 1 text, 2 picture
+pidx    !byte 0                         ; next byte of the picture block
+pcnt    !byte 0                         ; cells left in the command
+prep    !byte 0                         ; 1: repeat, 0: literal
+pcode   !byte 0
+phi     !byte 0
+pscr    !word 0                         ; the screen cell to write next
+apos    !word 0                         ; sound bytes left in the packet
+acnt    !word 0
+aplay   !byte 0
+akeyt   !byte 0
+oldacr  !byte 0
 cnt     !word 0
 skip    !byte 0
 tmo     !byte 0

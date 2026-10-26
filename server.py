@@ -16,6 +16,7 @@ Run:  server.py VIDEO_OR_URL      converts while it plays, loops files,
 """
 import argparse
 import collections
+import concurrent.futures
 import math
 import shutil
 import os
@@ -44,6 +45,123 @@ DELTA = 0xFE    # delta frame: (skip, count, count codes)... then (0, 0)
 PAD = 0xFD      # filler between frames, ignored by the client
 SEARCH = 0xFC   # nothing to play: the client goes to the search screen
 RLE = 0xFB      # run-length key frame: see encode_rle
+AUDIO = 0xFA    # audio mode: packets of 1-bit sound follow, see AUDIO_PACKET
+LEAVE = 0xFF    # in audio mode, at a packet start: back to video frames
+STOPPED = 0xF9  # the server stops: the PET ends PDV with a message
+# Audio mode (A key): bits per second that the PET plays. Its VIA shifts a
+# bit every 42 cycles (23.8 kHz), plus a short pause after each byte until
+# the next byte goes in. Tune this by ear if the pitch is off.
+AUDIO_RATE = 22000
+AUDIO_PREFILL_BYTES = 16 * 256               # the PET buffers this much first
+AUDIO_PREFILL = AUDIO_PREFILL_BYTES * 8 / AUDIO_RATE   # in seconds of sound
+AUDIO_METHOD = "clip"   # set by --audio-method: clip or pdm, see convert.py
+# After the AUDIO marker the stream is packets of AUDIO_PACKET bytes:
+# AUDIO_TIME screen codes of the time or a message (in the title on row
+# 0, see AUDIO_TITLE), a picture
+# block of AUDIO_PIC bytes, then the sound. The PET shows the text and
+# applies the picture block when the sound of the packet starts to play.
+# The picture blocks build a slow slide show; see picture_block().
+AUDIO_PACKET = 512
+AUDIO_TIME, AUDIO_PIC = 9, 16
+AUDIO_SOUND = AUDIO_PACKET - AUDIO_TIME - AUDIO_PIC
+PIC_END = 0xFF       # ends a picture block early
+# The title on row 0 in audio mode, around the time field. client.a has
+# the column of the field (TIMEX): 31 for 80 columns, 13 for 40.
+AUDIO_TITLE = {80: ("AUDIO MODE ", " - PRESS A FOR VIDEO"), 40: ("AUDIO ", " - A: VIDEO")}
+
+
+def audio_title(cols, field):
+    """(row 0 text, column of the time field) in audio mode."""
+    before, after = AUDIO_TITLE[cols]
+    line = before + field.ljust(AUDIO_TIME)[:AUDIO_TIME] + after
+    start = (cols - len(line)) // 2
+    return " " * start + line, start + len(before)
+
+
+def time_field(seconds):
+    """The time for the title: "(1:23)"."""
+    return f"({clock(seconds)})"
+
+
+def audio_packet(text, picture, sound):
+    """One packet of the audio stream. The text comes first: its screen
+    codes are never LEAVE, so the PET can tell a LEAVE at a packet start."""
+    codes = bytes(screen_code(ch) for ch in text.ljust(AUDIO_TIME)[:AUDIO_TIME])
+    picture = bytes(picture)[:AUDIO_PIC].ljust(AUDIO_PIC, bytes([PIC_END]))
+    return codes + picture + bytes(sound)
+
+
+def silent_packet(text):
+    """A packet without sound and without picture changes, for example
+    while the sound is not ready yet."""
+    return audio_packet(text, b"", bytes(AUDIO_SOUND))
+
+
+def picture_block(screen, target, keep=range(0)):
+    """The next AUDIO_PIC bytes of picture commands that bring `screen`
+    (a bytearray, updated here) closer to `target`, or None when they are
+    equal. Cells in `keep` are left alone (the time on row 1). Each block
+    stands alone, with absolute positions, so a block that is never sent
+    does not confuse the PET:
+      literal  hi = (length - 1) << 3 | pos >> 8, lo = pos & 255, then
+               length (1-14) screen codes
+      repeat   hi = 0x80 | pos >> 8, lo, count (1-255), code
+      end      PIC_END
+    Positions are 0-2047, so a header is never PIC_END."""
+    n = len(target)
+
+    def changed(i):
+        return screen[i] != target[i] and i not in keep
+
+    out = bytearray()
+    i = 0
+    while len(out) < AUDIO_PIC:
+        while i < n and not changed(i):
+            i += 1
+        if i >= n:
+            break
+        run = 1
+        while i + run < n and run < 255 and target[i + run] == target[i] and (i + run) not in keep:
+            run += 1
+        if run >= 5 and len(out) + 4 <= AUDIO_PIC:
+            out += bytes([0x80 | i >> 8, i & 255, run, target[i]])
+            screen[i:i + run] = bytes([target[i]]) * run
+            i += run
+            continue
+        room = AUDIO_PIC - len(out) - 2
+        if room < 1:
+            break
+        length = 1
+        while length < min(room, 14) and i + length < n and (i + length) not in keep:
+            j = i + length
+            if not (changed(j) or (j + 1 < n and changed(j + 1))):
+                break                          # a gap: cheaper as a new command
+            if j + 4 < n and len(set(target[j:j + 5])) == 1 and changed(j):
+                break                          # a run of 5: a repeat command
+            length += 1
+        out += bytes([(length - 1) << 3 | i >> 8, i & 255]) + target[i:i + length]
+        screen[i:i + length] = target[i:i + length]
+        i += length
+    if not out:
+        return None
+    return bytes(out)
+
+
+def apply_block(screen, block):
+    """Apply a picture block to `screen` (a bytearray), as the PET does."""
+    i = 0
+    while i + 1 < len(block) and block[i] != PIC_END:
+        hi, lo = block[i], block[i + 1]
+        pos = (hi & 7) << 8 | lo
+        if hi & 0x80:
+            count, code = block[i + 2] or 256, block[i + 3]
+            screen[pos:pos + count] = bytes([code]) * min(count, len(screen) - pos)
+            i += 4
+        else:
+            length = (hi >> 3 & 15) + 1
+            codes = block[i + 2:i + 2 + length]
+            screen[pos:pos + len(codes)] = codes
+            i += 2 + length
 
 
 def clock(seconds):
@@ -169,12 +287,14 @@ class LiveSource:
     def __init__(self, source, matchers, fps, zoom="fit", aspect=1.8):
         import convert
         self.matchers = matchers         # {80: Matcher, 40: Matcher}
+        self.aspect = aspect
         # the values from the command line, for the R key
         m = matchers[80]
         self.start_settings = {"brightness": m.brightness, "contrast": m.contrast,
                                "gamma": m.gamma, "dither": int(m.dither)}
         self.cols = 80
         self.latest = None
+        self.latest_url = None           # the video that latest belongs to
         self.count = 0
         self.lock = threading.Lock()
         self.ready = threading.Event()
@@ -201,15 +321,18 @@ class LiveSource:
         self.loop_end = None
         self.settings_version = 0    # counts setting changes
         self.retry_at = None         # time of the next try to get the video
+        self.audio = False           # audio mode: sound instead of video
+        self.media = {}              # (url, audio) -> Future of (media, duration)
+        self.media_lock = threading.Lock()
 
         def run():
             while True:
-                if self.menu is not None or self.url is None:
+                if self.menu is not None or self.url is None or self.audio:
                     time.sleep(0.05)
                     continue
                 self.switch = False
-                say(f"opening {self.url}")
-                media, self.duration = convert.resolve(self.url, log=say)
+                media = self.get_media()
+                self.prefetch_sound()
                 start, self.seek_to = self.seek_to or 0.0, None
                 play(media, start)
 
@@ -256,8 +379,11 @@ class LiveSource:
                             self.seek_to = self.loop_start or 0.0
                     with self.lock:
                         self.latest = codes.tobytes()
+                        self.latest_url = self.url
                         self.count += 1
                     self.ready.set()
+                if self.leaving():
+                    return                   # a menu, a new video or audio mode
                 if self.paused:
                     # stop the decoder and keep the last frame on the PET;
                     # convert it again when a setting or the width changes
@@ -285,6 +411,7 @@ class LiveSource:
                             prev, prev_cols = codes, cols
                             with self.lock:
                                 self.latest = codes.tobytes()
+                                self.latest_url = self.url
                                 self.count += 1
                             self.ready.set()
                         time.sleep(0.05)
@@ -342,9 +469,55 @@ class LiveSource:
 
     # ---- video choice: menu and YouTube search
     def leaving(self):
-        """True when the decoder must stop: a menu shows or a new video
-        was picked."""
-        return self.menu is not None or self.switch
+        """True when the decoder must stop: a menu shows, a new video was
+        picked, or audio mode is on."""
+        return self.menu is not None or self.switch or self.audio
+
+    def still(self, at, cols):
+        """The picture at `at` seconds as screen codes, for the slide show
+        in audio mode, or None."""
+        import convert
+        media = self.get_media()
+        if media is None:
+            return None
+        big = self.matchers[80]
+        for gray in convert.gray_frames(media, 1, big.width, big.height, False, max_frames=1,
+                                        start=at, aspect=self.aspect, zoom=self.zoom):
+            if cols == 40:
+                gray = gray.reshape(big.height, 320, 2).mean(axis=2)
+            return self.matchers[cols].codes_for(gray).tobytes()
+        return None
+
+    def get_media(self, audio=False):
+        """The media for the current URL, the video or the sound stream:
+        resolved once, then reused, so that switching between video and
+        audio mode does not run yt-dlp again. A caller that comes while
+        another thread resolves the same media waits for its result; a
+        failed lookup is tried again by the next caller."""
+        import convert
+        url = self.url
+        key = (url, audio)
+        with self.media_lock:
+            pending = self.media.get(key)
+            mine = pending is None or (pending.done() and pending.result()[0] is None)
+            if mine:
+                pending = self.media[key] = concurrent.futures.Future()
+        if mine:
+            say(f"opening {url}" + (" (sound)" if audio else ""))
+            try:
+                pending.set_result(convert.resolve(url, log=say, audio=audio))
+            except BaseException:
+                pending.set_result((None, None))
+                raise
+        media, duration = pending.result()
+        if media is not None:
+            self.duration = duration
+        return media
+
+    def prefetch_sound(self):
+        """Look up the sound stream in the background, so that a later
+        switch to audio mode does not wait for yt-dlp."""
+        threading.Thread(target=self.get_media, kwargs={"audio": True}, daemon=True).start()
 
     PAGE_SIZE = 20
 
@@ -572,6 +745,13 @@ class LiveSource:
             return "status"
         elif k == "h":
             return "toggle"
+        elif k == "a":
+            # audio mode: the PET plays the sound and shows a still frame
+            self.audio = not self.audio
+            if not self.audio:
+                self.seek_to = self.position    # the video goes on from here
+            say("audio mode" if self.audio else "video mode")
+            return "status"
         else:
             return None
         self.apply_settings(self.settings())    # same values for both widths
@@ -598,6 +778,7 @@ class LiveSource:
                  f"G)AMMA:{m.gamma:.1f}",
                  f"D)ITHER:{'ON' if int(m.dither) else 'OFF'}"],
                 [f"Z)OOM:{self.zoom.upper():<7}",
+                 f"A)UDIO:{'ON' if self.audio else 'OFF':<3}",
                  "R)ESET"]]
 
     # hotkeys as KEY)WHAT IT DOES, like the settings
@@ -662,6 +843,116 @@ class LiveSource:
         return "  ".join(out)
 
 
+class AudioFeed:
+    """The packets of an audio session. A background thread makes the
+    sound ahead: yt-dlp and the start of ffmpeg can take seconds, and a
+    request from the PETdisk must not wait that long. packet() returns the
+    next packet if its sound is ready, else a silent packet ("BUFFERING").
+    Keeps at most AHEAD seconds of sound ready.
+
+    The picture blocks make a slide show: the picture at the time of the
+    packet in which the previous slide is complete, sent cell by cell
+    where it differs from `screen`, what the PET shows when the feed
+    starts. Cells in `keep` (the title) are left alone. With `clear`, the
+    picture of the old video is cleared first. The picture goes
+    into a packet only when the packet is sent, not when its sound is
+    made, so that it is not AHEAD seconds late. Pictures are grabbed in
+    another thread, because a grab starts ffmpeg (and yt-dlp for the
+    first one), which takes about a second: the sound must not wait for
+    it. A still video would ask for a picture at every packet, so a new
+    one comes at most every SLIDE seconds of sound."""
+
+    AHEAD = 20.0
+    SLIDE = 5.0          # seconds of sound at least between two pictures
+    RETRY = 10.0         # seconds of sound before the next try for a picture
+
+    def __init__(self, source, start, rate, method, cols=80, screen=None, keep=range(0),
+                 clear=False):
+        self.lock = threading.Lock()
+        self.sounds = collections.deque()    # (seconds, sound bytes) of the next packets
+        self.limit = int(rate / 8 * self.AHEAD / AUDIO_SOUND)
+        self.stopped = False
+        self.source, self.cols, self.keep = source, cols, keep
+        self.screen = bytearray(screen if screen is not None else bytes([32]) * (cols * 25))
+        self.target, self.grab, self.next_grab = None, None, start
+        if clear:
+            # another video: first clear the old picture, then the slides
+            self.target = bytes([32]) * (cols * 25)
+        self.grabber = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        threading.Thread(target=self.run, args=(source, start, rate, method),
+                         daemon=True).start()
+
+    def run(self, source, start, rate, method):
+        import convert
+        media = source.get_media(audio=True)
+        if media is None or self.stopped:
+            return
+        sound = convert.AudioStream(media, start, rate, log=say,
+                                    loop_start=source.loop_start or 0.0, method=method)
+        try:
+            while not self.stopped:
+                with self.lock:
+                    full = len(self.sounds) >= self.limit
+                if full:
+                    time.sleep(0.05)
+                    continue
+                at = sound.pos
+                data = sound.read(AUDIO_SOUND)
+                with self.lock:
+                    self.sounds.append((at, data))
+        finally:
+            sound.close()
+
+    def ready(self):
+        """Packets of sound ready."""
+        with self.lock:
+            return len(self.sounds)
+
+    def packet(self):
+        with self.lock:
+            item = self.sounds.popleft() if self.sounds else None
+        if item is None:
+            return silent_packet("BUFFERING")
+        at, data = item
+        return audio_packet(time_field(at), self.picture(at), data)
+
+    def picture(self, at):
+        """The picture block for the packet at `at` seconds."""
+        if self.grab is not None and self.grab.done():
+            try:
+                picture = self.grab.result()
+            except Exception as e:               # ffmpeg or yt-dlp failed
+                say(f"no picture: {e}")
+                picture = None
+            self.grab = None
+            if picture is None:
+                self.next_grab = at + self.RETRY
+            else:
+                self.target = picture
+        block = None
+        if self.target is not None:
+            block = picture_block(self.screen, self.target, self.keep)
+        if block is None and self.grab is None and at >= self.next_grab:
+            # the slide is complete: the next one shows this moment
+            self.grab = self.grabber.submit(self.source.still, at, self.cols)
+            self.next_grab = at + self.SLIDE
+        return block or b""
+
+    def close(self):
+        self.stopped = True
+        self.grabber.shutdown(wait=False, cancel_futures=True)
+
+
+class PausedFeed:
+    """The packets of an audio session while the video is paused."""
+
+    def packet(self):
+        return silent_packet("PAUSED")
+
+    def close(self):
+        pass
+
+
 class Stream:
     """The virtual VIDEO80.SEQ or VIDEO40.SEQ. Every OPEN on the PET reads from offset 0, which
     starts a new session: a key frame, then delta frames of whatever frame is
@@ -678,6 +969,8 @@ class Stream:
         self.last_codes = None           # newest frame sent, for the terminal view
         self.t0 = time.monotonic()   # playback clock, kept across sessions
         self.overlay_on = False      # settings and hotkeys on the PET screen
+        self.stopping = False        # Ctrl+C: tell the PET to end PDV, then stop
+        self.stop_sent = False       # the PET got STOPPED, or 2 from PICK
         self.reset()
 
     def show_status(self, kind="status"):
@@ -699,12 +992,23 @@ class Stream:
 
     def terminal_codes(self):
         """The screen for the terminal view: the search screen while it
-        shows, with the rows of the RESULTS file, else the frame sent last.
+        shows, with the rows of the RESULTS file, else what the PET shows.
         During a search the PET does not read the video stream, so the
-        frame sent last would be an old video frame."""
+        frame sent last would be an old video frame. In audio mode the PET
+        shows a packet only when it plays its sound, after its buffer."""
         if self.source.menu is not None:
             return text_screen(self.source.results_lines(self.cols)[:23], self.cols)
+        if self.audio is not None and self.snapshots:
+            return self.snapshots[min(self.playing_packet(), len(self.snapshots) - 1)]
         return self.last_codes
+
+    def playing_packet(self):
+        """How many packets of this audio session the PET has played: it
+        starts after AUDIO_PREFILL_BYTES, then plays the sound in time."""
+        if self.play_t0 is None:
+            return 0
+        per_second = AUDIO_RATE / 8 / AUDIO_SOUND
+        return int((time.monotonic() - self.play_t0) * per_second) + 1
 
     def reset(self):
         self.base = 0                # stream offset of buf[0]
@@ -713,6 +1017,12 @@ class Stream:
         self.last_index = None
         self.frames_sent = 0
         self.bytes_frames = 0
+        if getattr(self, "audio", None) is not None:
+            self.audio.close()
+        self.audio = None            # the sound source of an audio session
+        self.stop_here = False       # STOPPED is in this session
+        self.snapshots = []          # audio: the screen after each packet sent
+        self.play_t0 = None          # audio: when the PET started to play
 
     def read(self, start, end, cols=80):
         if start == 0:
@@ -721,12 +1031,37 @@ class Stream:
             self.source.set_cols(cols)
             self.source.close_results()      # back from the search screen
             say(f"PET opened the video, {cols} columns")
+        if self.stopping:
+            # the server stops: the PET ends PDV. At a frame or packet
+            # boundary, after LEAVE in audio mode; then padding only
+            if not self.stop_here:
+                if self.audio is not None:
+                    self.audio.close()
+                    self.audio = None
+                    self.buf += bytes([LEAVE])
+                self.buf += bytes([STOPPED])
+                self.stop_here = self.stop_sent = True
+            self.buf += bytes([PAD]) * max(0, end - self.base - len(self.buf))
+            return self.cut(start, end)
         if self.source.url is None:
             # nothing to play: send the PET to the search screen
             if start == 0:
                 return bytes([SEARCH]) + bytes([PAD]) * (end - start - 1)
             return bytes([PAD]) * (end - start)
         while self.base + len(self.buf) < end:
+            # the server can switch the mode within the stream: to audio at
+            # a frame boundary, back to video at a packet boundary
+            if self.audio is not None:
+                self.next_packet()
+                continue
+            if self.source.audio:
+                self.start_audio()
+                continue
+            if self.source.menu is None and not self.source.ready.is_set():
+                # no frame yet (a new video starts): pad, do not keep the
+                # PETdisk waiting
+                self.buf += bytes([PAD]) * (end - self.base - len(self.buf))
+                break
             index, codes = self.source.current(self.t0)
             if self.overlay_on:
                 # a new frame also when only the overlay text changes
@@ -744,6 +1079,12 @@ class Stream:
             self.frames_sent += 1
             self.bytes_frames += len(frame)
             self.stats.frame(len(frame), 1 + len(codes))
+        if self.audio is not None:
+            self.audio_clock()
+        return self.cut(start, end)
+
+    def cut(self, start, end):
+        """Bytes [start, end) of the stream; drops what is older than KEEP."""
         lo = max(0, start - self.base)
         out = bytes(self.buf[lo:end - self.base])
         drop = start - self.base - self.KEEP
@@ -751,6 +1092,88 @@ class Stream:
             del self.buf[:drop]
             self.base += drop
         return out
+
+    def time_cells(self):
+        """The cells of the time field in the title, which the PET writes
+        itself."""
+        timex = audio_title(self.cols, "")[1]
+        return range(timex, timex + AUDIO_TIME)
+
+    def new_feed(self, clear=False):
+        """The sound source from the playback position on; `clear`: another
+        video, so the picture of the old one is cleared first."""
+        src = self.source
+        at = src.seek_to if src.seek_to is not None else src.position
+        src.seek_to = None
+        src.position = at
+        self.audio_start, self.audio_t0 = at, None
+        self.audio_url, self.audio_paused = src.url, src.paused
+        say(f"audio from {clock(at)}" + (", paused" if src.paused else ""))
+        if src.paused or src.url is None:
+            return PausedFeed()
+        # the slide show leaves row 0 alone: the title is there
+        return AudioFeed(src, at, AUDIO_RATE, AUDIO_METHOD, self.cols,
+                         bytes(self.screen), range(0, self.cols), clear=clear)
+
+    def next_packet(self):
+        """The next audio packet. A change at the server takes effect here:
+        audio mode off, another video, a seek or a pause."""
+        src = self.source
+        if not src.audio:
+            self.audio.close()
+            self.audio = None
+            self.snapshots, self.play_t0 = [], None
+            self.buf += bytes([LEAVE])       # at a packet start
+            self.prev = self.last_index = None
+            say("back to video")
+            return
+        if (src.url != self.audio_url or src.paused != self.audio_paused
+                or src.seek_to is not None):
+            self.audio.close()
+            self.audio = self.new_feed(clear=src.url != self.audio_url)
+        packet = self.audio.packet()
+        self.buf += packet
+        # what the PET shows after this packet: for the next feed and the
+        # terminal view
+        apply_block(self.screen, packet[AUDIO_TIME:AUDIO_TIME + AUDIO_PIC])
+        cells = self.time_cells()
+        self.screen[cells.start:cells.stop] = packet[:AUDIO_TIME]
+        self.last_codes = bytes(self.screen)
+        self.snapshots.append(self.last_codes)
+        if self.play_t0 is None and len(self.snapshots) * AUDIO_PACKET >= AUDIO_PREFILL_BYTES:
+            self.play_t0 = time.monotonic()  # the PET starts to play about now
+
+    def start_audio(self):
+        """Audio mode: the picture on the screen now, with the title and
+        the time on row 0, the AUDIO marker, then the packets of the sound
+        from the playback position on."""
+        src = self.source
+        at = src.seek_to if src.seek_to is not None else src.position
+        cols = self.cols
+        n = cols * 25
+        # the last picture, if it is of this video: after a pick on the
+        # PET in audio mode it is of the old one, so the screen is empty
+        same = getattr(src, "latest_url", src.url) == src.url
+        picture = (src.latest if src.latest is not None and len(src.latest) == n and same
+                   else bytes([32]) * n)
+        title = audio_title(cols, time_field(at))[0]
+        screen = bytearray(picture)
+        screen[:cols] = bytes(screen_code(ch) for ch in title.ljust(cols))
+        self.screen = screen
+        codes = bytes(screen)
+        self.buf += encode_frame(None, codes) + bytes([AUDIO])
+        self.prev = self.last_codes = codes
+        self.snapshots, self.play_t0 = [codes], None
+        self.audio = self.new_feed()
+
+    def audio_clock(self):
+        """The playback position in audio mode: the PET plays the sound
+        about AUDIO_PREFILL seconds after it reads the first bytes."""
+        now = time.monotonic()
+        if self.audio_t0 is None:
+            self.audio_t0 = now
+        if not self.source.paused:
+            self.source.position = self.audio_start + max(0.0, now - self.audio_t0 - AUDIO_PREFILL)
 
     def save_state(self):
         return {"elapsed": time.monotonic() - self.t0, "base": self.base,
@@ -969,7 +1392,7 @@ class Display:
         server = pack(["server only:",
                        "arrows: up/down 1 min, right/left 10 s",
                        "lowercase b/c/g up, uppercase down",
-                       "s: YouTube search here", "Ctrl-C quits"], w)
+                       "s: YouTube search here", "Ctrl-C stops (the PET first)"], w)
         if st["active"]:
             server += pack([f"{st['fps']:4.1f} fps (min/max {st['fps_range']})",
                             f"{st['kbs']:4.2f} KB/s",
@@ -984,6 +1407,10 @@ class Display:
         retry = src.retry_text()
         if retry:
             lines.append(f"{self.RED}{retry[:w]}{self.RESET}")
+        if stream.stopping:
+            text = ("stopping: the PET has ended PDV" if stream.stop_sent
+                    else "stopping: waiting for the PET to end PDV (Ctrl-C again stops at once)")
+            lines.append(f"{self.RED}{text[:width]}{self.RESET}")
         sys.stdout.write("\x1b[H" + "\n".join(l + "\x1b[K" for l in lines) + "\x1b[J")
         sys.stdout.flush()
 
@@ -1125,7 +1552,12 @@ def handle(query, stream, log):
     # server terminal: "1" makes the PET start the video
     if re.fullmatch(r"PICK(\.SEQ)?", name.upper()):
         src = stream.source
-        data = b"1" if src.menu is None and src.url is not None else b"0"
+        if stream.stopping:
+            data = b"2"                      # the server stops: end PDV
+            if "s" in q:
+                stream.stop_sent = True
+        else:
+            data = b"1" if src.menu is None and src.url is not None else b"0"
         if q.get("l") == "1":
             return response(f"{len(data)}\r\n".encode())
         if "s" in q and "e" in q:
@@ -1217,6 +1649,25 @@ def timing(query, t_accept, t_req, t_done, stream=None):
         pass
 
 
+STOP_WAIT = 20.0     # seconds at most for the PET to end PDV on Ctrl+C
+
+
+def graceful_stop(stream):
+    """Ctrl+C and SIGTERM: the first one makes the PET end PDV before the
+    server stops, because the PETdisk crashes when it cannot connect. The
+    second one stops at once."""
+    import signal
+
+    def handler(signum, frame):
+        if stream.stopping:
+            raise KeyboardInterrupt
+        stream.stopping = time.monotonic()
+        say("stopping: the PET ends PDV first (Ctrl-C again stops at once)")
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 def serve(port, stream, verbose, keys):
     def log(msg):
         if verbose:
@@ -1237,8 +1688,17 @@ def serve(port, stream, verbose, keys):
     say(f"serving {SERVE_DIR} on port {port}")
     watched = {f: os.path.getmtime(f) for f in WATCH}
     next_check = 0.0
+    last_request = time.monotonic()
     while True:
         now = time.monotonic()
+        if stream.stopping:
+            # stop when the PET has ended PDV and sends no more requests, or
+            # when no PET runs PDV (no requests), or after STOP_WAIT at most
+            idle = now - last_request
+            if ((stream.stop_sent and idle > 2.0) or idle > 4.0
+                    or now - stream.stopping > STOP_WAIT):
+                say("stopped")
+                return
         if now >= next_check:
             next_check = now + 1.0
             if any(os.path.getmtime(f) != t for f, t in watched.items()):
@@ -1278,7 +1738,7 @@ def serve(port, stream, verbose, keys):
                 query = urlsplit(parts[1]).query
                 t_req = time.monotonic()
                 conn.sendall(handle(query, stream, log))
-                t_done = time.monotonic()
+                t_done = last_request = time.monotonic()
                 timing(query, t_accept, t_req, t_done, stream)
         except (OSError, ValueError) as e:
             log(f"error: {e}")
@@ -1312,6 +1772,9 @@ def main():
     ap.add_argument("--gamma", type=float, default=1.0, help="default 1")
     ap.add_argument("--dither", type=int, default=0, choices=(0, 1),
                     help="0 none (default), 1 Floyd-Steinberg")
+    ap.add_argument("--audio-method", choices=("clip", "pdm"), default="clip",
+                    help="1-bit sound in audio mode (A key): clip, the sign of the sound "
+                         "(default, suits the small PET speaker), or pdm, delta-sigma")
     ap.add_argument("--stick", type=float, default=6.0,
                     help="keep a cell's previous glyph if it is at most this many "
                          "pixels worse; fewer changes per frame (default 6, 0 = off)")
@@ -1321,6 +1784,8 @@ def main():
     ap.add_argument("--plain", action="store_true",
                     help="print log lines instead of the full-screen view")
     a = ap.parse_args()
+    global AUDIO_METHOD
+    AUDIO_METHOD = a.audio_method
 
     import convert
     matchers = {cols: convert.Matcher(cols, dither=a.dither, brightness=a.brightness,
@@ -1345,6 +1810,7 @@ def main():
         say("keys: b/B brightness, c/C contrast, g/G gamma, d dither, z zoom, r reset b/c/g/d/z, "
             "1/2/3/4 seek -60/-10/+10/+60 s, 5/6 frame -1/+1, ! rewind to start, space pause, s search, "
             "h toggle status/help on the PET (lowercase up, uppercase down)")
+    graceful_stop(stream)
     try:
         serve(a.port, stream, not a.quiet, keys)
     except KeyboardInterrupt:
