@@ -391,9 +391,11 @@ aloop   lda VIAIFR                      ; 8 bits out?
 +       inc akeyt                       ; the keyboard now and then
         bne +
         jsr akeys
-+       lda acnt+1                      ; room in the buffer?
-        cmp #APAGES - 1
-        bcs aloop                       ; no: the drive waits
++       lda acnt+1                      ; room in the buffer? Keep 3 pages
+        cmp #APAGES - 3                 ; free behind the playing byte: the
+        bcs aloop                       ; display bytes of the packet that
+                                        ; plays (up to 512 bytes back) stay
+                                        ; intact while dstep reads them
         bit VIAPB
         bmi aloop                       ; DAV high: no data yet
         lda nrfdl

@@ -1538,6 +1538,27 @@ def response(body, status="200 OK"):
 
 
 def handle(query, stream, log):
+    """The answer to one petdisk.php request. The PETdisk MAX firmware does
+    not look at the HTTP status: it reads a size from the body of a size
+    request, and with an empty body it gets a random size. So a size
+    request always gets a size, 0 for a missing file (the PET then reports
+    FILE NOT FOUND), and a directory request always gets an empty line at
+    the end, also when the request is broken."""
+    try:
+        return answer(query, stream, log)
+    except Exception as e:                   # a broken request: answer safely
+        say(f"bad request {query[:60]!r}: {e}")
+        params = query.split("&")
+        if "d=1" in params:
+            body = b"\n"                      # an empty directory page
+        elif "l=1" in params:
+            body = b"0\r\n"                  # size 0: FILE NOT FOUND
+        else:
+            body = b""
+        return response(body, "400 Bad Request")
+
+
+def answer(query, stream, log):
     q = {k: v[-1] for k, v in parse_qs(query, keep_blank_values=True).items()}
     if q.get("d") == "1":
         page = int(q.get("p", "0") or 0)
@@ -1546,7 +1567,7 @@ def handle(query, stream, log):
 
     name = q.get("file")
     if name is None:
-        return response(b"", "400 Bad Request")
+        return response(b"0\r\n", "400 Bad Request")
     video_cols = VIDEO_NAMES.get(name.upper())
     is_video = video_cols is not None
 
@@ -1578,23 +1599,27 @@ def handle(query, stream, log):
         if "s" in q and "e" in q:
             return response(data[int(q["s"]):int(q["e"])])
 
+    # A real file in serve/ wins over the command names below, so that a
+    # file whose name starts with Q, K or C can be loaded
+    path = None if is_video else find_file(name)
+
     # An entry in the search field: C<number>, CN or CP
     ent = re.fullmatch(r"C(\d+|N|P)(\.SEQ)?", name.upper())
-    if ent and q.get("l") == "1":
+    if ent and path is None and q.get("l") == "1":
         say(f"PET entry {ent.group(1)}")
         stream.source.entry(ent.group(1))
         return response(b"0\r\n")
 
     # Search text from the PET: files named Q<text>, then an empty Q
     qry = re.fullmatch(r"Q(.*?)(\.SEQ|\.PRG)?", name.upper(), re.S)
-    if qry and q.get("l") == "1":
+    if qry and path is None and q.get("l") == "1":
         stream.source.add_query_part(qry.group(1))
         return response(b"0\r\n")
 
     # Hotkey from the PET: it opens a file named K<key code>, for example
     # K66.SEQ. Answer "size 0", so the open fails and nothing is read.
     cmd = re.fullmatch(r"K(\d+)(\.SEQ|\.PRG)?", name.upper())
-    if cmd and q.get("l") == "1":
+    if cmd and path is None and q.get("l") == "1":
         key = int(cmd.group(1))
         k = stream.source.pet_key(key)
         kind = stream.source.command(k)
@@ -1608,11 +1633,10 @@ def handle(query, stream, log):
     if q.get("l") == "1":
         if is_video:
             size = VIDEO_SIZE
+        elif path is None:
+            log(f"size {name}: not found")
+            return response(b"0\r\n")          # size 0: FILE NOT FOUND on the PET
         else:
-            path = find_file(name)
-            if path is None:
-                log(f"size {name}: not found")
-                return response(b"", "404 Not Found")
             size = os.path.getsize(path)
         log(f"size {name} = {size}")
         return response(f"{size}\r\n".encode())
@@ -1629,10 +1653,9 @@ def handle(query, stream, log):
             body = stream.read(start, end, video_cols)
             stream.stats.block(len(body))
             return response(body)
-        path = find_file(name)
         if path is None:
             log(f"range {name}: not found")
-            return response(b"", "404 Not Found")
+            return response(b"")
         with open(path, "rb") as f:
             f.seek(start)
             body = f.read(max(0, end - start))
@@ -1738,7 +1761,8 @@ def serve(port, stream, verbose, keys):
             continue
         t_accept = time.monotonic()
         try:
-            conn.settimeout(5.0)
+            conn.settimeout(1.0)             # the PETdisk sends its request at once:
+                                             # a silent client must not hold the PET up
             req = b""
             while b"\r\n\r\n" not in req and len(req) < 4096:
                 chunk = conn.recv(1024)

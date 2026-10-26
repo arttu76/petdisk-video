@@ -2,6 +2,7 @@
 handle()."""
 
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -44,10 +45,41 @@ class HandleTest(unittest.TestCase):
                        for s in range(0, len(data), 512))
         self.assertEqual(got, data)
 
+    def test_a_missing_file_is_size_0(self):
+        # the firmware does not look at the status: an empty body would
+        # give it a random size, and the PET would load garbage or hang
+        self.assertEqual(self.get("file=KISSA.PRG&l=1"), ("HTTP/1.0 200 OK", b"0\r\n"))
+        self.assertEqual(self.get("file=kissa&l=1"), ("HTTP/1.0 200 OK", b"0\r\n"))
+        self.assertEqual(self.get("file=KISSA.PRG&s=0&e=512"), ("HTTP/1.0 200 OK", b""))
+
+    def test_broken_requests_get_safe_answers(self):
+        self.assertEqual(self.get("x=1"), ("HTTP/1.0 400 Bad Request", b"0\r\n"))
+        self.assertEqual(self.get("file=PDV80.PRG"), ("HTTP/1.0 400 Bad Request", b""))
+        self.assertEqual(self.get("file=PDV80.PRG&s=abc&e=512"), ("HTTP/1.0 400 Bad Request", b""))
+        self.assertEqual(self.get("d=1&p=x"), ("HTTP/1.0 400 Bad Request", b"\n"))
+
+    def test_an_internal_error_gets_a_safe_answer(self):
+        with mock.patch.object(server, "find_file", side_effect=OSError("disk gone")), \
+                mock.patch.object(server, "say"):
+            self.assertEqual(self.get("file=PDV80.PRG&l=1"), ("HTTP/1.0 400 Bad Request", b"0\r\n"))
+            self.assertEqual(self.get("file=PDV80.PRG&s=0&e=512"), ("HTTP/1.0 400 Bad Request", b""))
+
+    def test_real_files_win_over_command_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, data in (("QBERT.PRG", b"q" * 700), ("K5.PRG", b"k" * 10), ("CN.SEQ", b"c" * 3)):
+                with open(os.path.join(d, name), "wb") as f:
+                    f.write(data)
+            with mock.patch.object(server, "SERVE_DIR", d):
+                self.assertEqual(self.get("file=QBERT.PRG&l=1")[1], b"700\r\n")
+                self.assertEqual(self.get("file=QBERT.PRG&s=512&e=1024")[1], b"q" * 188)
+                self.assertEqual(self.get("file=K5.PRG&l=1")[1], b"10\r\n")
+                self.assertEqual(self.get("file=CN.SEQ&l=1")[1], b"3\r\n")
+                self.assertEqual(self.get("file=K66&l=1")[1], b"0\r\n")    # still a hotkey
+        src = self.stream.source
+        self.assertEqual(src.query_parts, [])                     # QBERT was no search text
+        self.assertEqual(src.matchers[80].brightness, 0.05)       # K66 was B
+
     def test_errors(self):
-        self.assertEqual(self.get("file=NOPE.PRG&l=1")[0], "HTTP/1.0 404 Not Found")
-        self.assertEqual(self.get("x=1")[0], "HTTP/1.0 400 Bad Request")
-        self.assertEqual(self.get("file=PDV80.PRG")[0], "HTTP/1.0 400 Bad Request")
         # nobody on the network can make the server build huge responses
         for s, e in ((0, server.MAX_RANGE + 1), (-1, 10), (10, 5)):
             self.assertEqual(self.get(f"file=VIDEO80.SEQ&s={s}&e={e}")[0],

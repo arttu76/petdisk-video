@@ -123,11 +123,18 @@ class NoVideoTest(unittest.TestCase):
             self.assertEqual(got, want)
 
     def test_errors(self):
-        self.assertEqual(self.server.get("file=NOPE.PRG&l=1")[0], 404)
+        self.assertEqual(self.server.get("file=NOPE.PRG&l=1"), (200, b"0\r\n"))
         self.assertEqual(self.server.get("file=VIDEO80.SEQ&s=0&e=100000")[0], 416)
         with socket.create_connection(("127.0.0.1", self.server.port), timeout=5) as s:
             s.sendall(b"POST /petdisk.php HTTP/1.0\r\n\r\n")
             self.assertTrue(s.recv(100).startswith(b"HTTP/1.0 405"))
+
+    def test_a_silent_client_holds_the_server_briefly(self):
+        with socket.create_connection(("127.0.0.1", self.server.port), timeout=5):
+            time.sleep(0.1)                                       # connected, sends nothing
+            t = time.monotonic()
+            self.assertEqual(self.server.get("file=PDV80.PRG&l=1")[0], 200)
+            self.assertLess(time.monotonic() - t, 1.5)
 
     def test_slow_or_broken_clients(self):
         # a client that sends nothing or closes at once must not stop the server

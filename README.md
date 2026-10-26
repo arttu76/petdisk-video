@@ -240,9 +240,11 @@ Rows 1 to 24 show a slide show. The server sends the pictures slowly, cell by ce
 
 The PET can play only 1-bit sound: its CB2 line is either on or off. The server sends 22,000 bits per second, each bit the sign of the sound (`--audio-method clip`). The sound is distorted, like the speaker of an old PC, but melodies and speech are easy to recognize. The other method, `--audio-method pdm`, can reproduce the sound more exactly, but it needs a speaker that plays low frequencies. On the speaker of an 8296, it gives mostly hiss.
 
-The keys work as in video mode, for example seek, pause and search. Each key press causes a short break, and the sound starts again after about 1.5 seconds. Changes in the server terminal take effect without a key press on the PET: A, another video from the search, a seek and a pause. The PET first plays the sound in its buffer, up to about 3.5 seconds.
+The keys work as in video mode, for example seek, pause and search. Each key press causes a short break, and the sound starts again after about 1.5 seconds. Changes in the server terminal take effect without a key press on the PET: A, another video from the search, a seek and a pause. The PET first plays the sound in its buffer, up to about 3 seconds.
 
 The server terminal shows the same screen as the PET, with the same delay.
+
+At the end of a YouTube video, the server terminal can show the ffmpeg message `Error during demuxing: Input/output`. It is the normal end of the sound stream, and the video starts again from the beginning.
 
 ## The server terminal
 
@@ -329,7 +331,7 @@ The tests need Python, numpy, Pillow and ffmpeg. Without ffmpeg, the tests that 
 - `test_livesource.py`: the hotkeys, the settings, the decoder after a zoom change, the help and status rows, and the YouTube search screen.
 - `test_handle.py`: the `petdisk.php` requests.
 - `test_convert.py`: the PETSCII conversion, ffmpeg decoding and zoom, and the yt-dlp calls.
-- `test_http.py`: the server as a process over HTTP, also a self-restart while the video plays.
+- `test_http.py`: the server as a process over HTTP, also a self-restart while the video or the sound plays.
 - `test_audio.py`: audio mode: the 1-bit sound, the packets, the background feed, the slide show, and the switches between video and audio mode within the stream.
 - `test_stop.py`: the stop after Ctrl+C and SIGTERM, also with a server process.
 - `test_vice.py`: optional, see below.
@@ -354,7 +356,7 @@ When the server runs again, press RETURN on the PET. The program is still in mem
 
 Do not press Ctrl+C a second time while the server waits for the PET. A second Ctrl+C stops the server at once, and the PETdisk can crash.
 
-When `server.py` or `convert.py` changes, the server restarts itself. It passes its listening socket and the stream state on to the new process, so the PET sees no interruption.
+When `server.py` or `convert.py` changes, the server restarts itself. It passes its listening socket and the stream state on to the new process, so the PET sees no interruption in video mode. In audio mode the sound source cannot go on in the new process: the PET stays in audio mode, and the sound starts again after a short break.
 
 ![HAL 9000's red eye from the film 2001: A Space Odyssey, shown in green PETSCII on a Commodore 8296](docs/hal.jpg)
 
