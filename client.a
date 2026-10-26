@@ -21,20 +21,23 @@ STOP   = $ffe1
 ; The BASIC part (stub.bas, tokenized by build.sh) opens VIDEO80 or VIDEO40 and
 ; calls this code. It returns when a key is pressed: KEYOUT holds the key,
 ; 0 for STOP. BASIC then sends the key to the server and reopens the video.
+; It also returns when there is nothing to play (KEYOUT 83, as for S) and
+; when the server stops (KEYOUT 0 and SRVSTOP 1).
 KEYOUT = ML - 1
 SRVSTOP = ML - 2                        ; 1: the server stopped
 KBCOUNT = $9e                           ; keys in the keyboard buffer
 KBBUF   = $026f                         ; keyboard buffer
 
 ; ---------------------------------------------------------------- machine code
-; Stream format, all bytes read with CHRIN:
+; Stream format, all bytes read with the get macro:
 ;   $FF + FRAME screen codes            key frame
 ;   $FE + (skip, count, count codes)... + (0, 0)
 ;                                       delta frame: skip cells, then copy
 ;   $FD                                 padding, ignored
 ;   $FC                                 nothing to play: go to the search
-;   $FA + audio bytes...                audio mode: 1-bit sound until a key,
-;                                       see the audio player below
+;   $FA + 512-byte packets...           audio mode: sound, time and picture
+;                                       until a key, LEAVE or $F9, see the
+;                                       audio player below
 ;   $F9                                 the server stops: back to BASIC with
 ;                                       SRVSTOP set, BASIC ends PDV
 ;   $FB + (control, codes)...           run-length key frame, until FRAME
@@ -310,10 +313,10 @@ chkstop jsr STOP
         jmp exit
 
 ; ---- audio player. After $FA the stream is packets of 512 bytes: DISP
-; display bytes (TEXTW screen codes of the time or BUFFERING for the
-; title on row 0, then a
-; picture block of PICB bytes for the slide show), then sound: 8 bits a byte, bit 7 first, each bit
-; 2 * (T2RATE + 2) cycles on CB2, which drives the speaker. The
+; display bytes (TEXTW screen codes of the time or BUFFERING for the title
+; on row 0, then a picture block of PICB bytes for the slide show), then
+; sound: 8 bits a byte, bit 7 first, each bit 2 * (T2RATE + 2) cycles on
+; CB2, which drives the speaker. The
 ; VIA shift register shifts the bits out under T2 control and sets IFR
 ; bit 2 when a byte is out; then the next byte goes in. A ring buffer
 ; covers the pauses of the PETdisk. Interrupts are off while the sound
@@ -534,8 +537,8 @@ akeydn  pla                             ; drop the return address
         lda oldacr
         sta VIAACR                      ; sound off
         cli                             ; the kernal reads the key
-        ldx #0                          ; wait up to about 0.4 s
-        ldy #0
+        ldx #0                          ; wait up to about 0.4 s:
+        ldy #40                         ; 40 x 256 x about 37 cycles
 -       lda KBCOUNT
         bne akeyin
         jsr STOP

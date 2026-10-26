@@ -40,7 +40,7 @@ LIST_EXT = (".prg", ".seq", ".d64")
 WATCH = [os.path.abspath(__file__), os.path.join(HERE, "convert.py")]
 
 
-KEY = 0xFF      # key frame: 2000 screen codes follow
+KEY = 0xFF      # key frame: all screen codes follow (2000, or 1000 for 40 columns)
 DELTA = 0xFE    # delta frame: (skip, count, count codes)... then (0, 0)
 PAD = 0xFD      # filler between frames, ignored by the client
 SEARCH = 0xFC   # nothing to play: the client goes to the search screen
@@ -56,11 +56,11 @@ AUDIO_PREFILL_BYTES = 16 * 256               # the PET buffers this much first
 AUDIO_PREFILL = AUDIO_PREFILL_BYTES * 8 / AUDIO_RATE   # in seconds of sound
 AUDIO_METHOD = "clip"   # set by --audio-method: clip or pdm, see convert.py
 # After the AUDIO marker the stream is packets of AUDIO_PACKET bytes:
-# AUDIO_TIME screen codes of the time or a message (in the title on row
-# 0, see AUDIO_TITLE), a picture
-# block of AUDIO_PIC bytes, then the sound. The PET shows the text and
-# applies the picture block when the sound of the packet starts to play.
-# The picture blocks build a slow slide show; see picture_block().
+# AUDIO_TIME screen codes of the time or a message (in the title on row 0,
+# see AUDIO_TITLE), a picture block of AUDIO_PIC bytes, then the sound.
+# The PET shows the text and applies the picture block when the sound of
+# the packet starts to play. The picture blocks build a slow slide show,
+# see picture_block().
 AUDIO_PACKET = 512
 AUDIO_TIME, AUDIO_PIC = 9, 16
 AUDIO_SOUND = AUDIO_PACKET - AUDIO_TIME - AUDIO_PIC
@@ -100,7 +100,7 @@ def silent_packet(text):
 def picture_block(screen, target, keep=range(0)):
     """The next AUDIO_PIC bytes of picture commands that bring `screen`
     (a bytearray, updated here) closer to `target`, or None when they are
-    equal. Cells in `keep` are left alone (the time on row 1). Each block
+    equal. Cells in `keep` are left alone (the title on row 0). Each block
     stands alone, with absolute positions, so a block that is never sent
     does not confuse the PET:
       literal  hi = (length - 1) << 3 | pos >> 8, lo = pos & 255, then
@@ -680,8 +680,8 @@ class LiveSource:
 
     def command(self, k):
         """Apply a hotkey: lowercase raises a value, uppercase lowers it.
-        Returns what to show on the PET ("status" or "help"), or None for an
-        unknown key."""
+        Returns "status" (a value changed), "toggle" (H: the overlay on or
+        off), or None for an unknown key."""
         m = self.matchers[80]
         if self.menu is not None:
             if k == "h":
@@ -954,10 +954,14 @@ class PausedFeed:
 
 
 class Stream:
-    """The virtual VIDEO80.SEQ or VIDEO40.SEQ. Every OPEN on the PET reads from offset 0, which
-    starts a new session: a key frame, then delta frames of whatever frame is
-    due at that moment. When no new frame is due, the rest of the block is padding, so the PET
-    gets each frame as soon as possible."""
+    """The virtual VIDEO80.SEQ or VIDEO40.SEQ. Every OPEN on the PET reads
+    from offset 0, which starts a new session: a key frame, then delta
+    frames of whatever frame is due at that moment. When no new frame is
+    due, the rest of the block is padding, so the PET gets each frame as
+    soon as possible. In audio mode the session is the AUDIO marker and
+    audio packets instead (see AudioFeed). The server can switch within the
+    stream: to audio at a frame boundary, back to video with LEAVE at a
+    packet boundary, and STOPPED when it stops."""
 
     KEEP = 65536     # bytes kept behind the newest request, for re-reads
 
@@ -974,7 +978,7 @@ class Stream:
         self.reset()
 
     def show_status(self, kind="status"):
-        """S and H switch the overlay on and off. Other keys change values,
+        """H switches the overlay on and off. Other keys change values,
         which the overlay shows live while it is on."""
         if kind == "toggle":
             self.overlay_on = not self.overlay_on
@@ -1021,6 +1025,7 @@ class Stream:
             self.audio.close()
         self.audio = None            # the sound source of an audio session
         self.stop_here = False       # STOPPED is in this session
+        self.resume_audio = False    # after a self-restart in audio mode: LEAVE first
         self.snapshots = []          # audio: the screen after each packet sent
         self.play_t0 = None          # audio: when the PET started to play
 
@@ -1031,6 +1036,9 @@ class Stream:
             self.source.set_cols(cols)
             self.source.close_results()      # back from the search screen
             say(f"PET opened the video, {cols} columns")
+        if self.resume_audio:
+            self.resume_audio = False
+            self.buf += bytes([LEAVE])       # out of the old audio session
         if self.stopping:
             # the server stops: the PET ends PDV. At a frame or packet
             # boundary, after LEAVE in audio mode; then padding only
@@ -1185,7 +1193,8 @@ class Stream:
                 "loop": (self.source.loop_start, self.source.loop_end),
                 "zoom": self.source.zoom,
                 "url": self.source.url, "menu": self.source.menu,
-                "results": self.source.results}
+                "results": self.source.results,
+                "audio": self.source.audio, "audio_session": self.audio is not None}
 
     def load_state(self, st):
         self.t0 = time.monotonic() - st["elapsed"]
@@ -1208,6 +1217,11 @@ class Stream:
             self.source.position = st["position"]
             self.source.seek_to = st["position"]
         self.source.set_cols(self.cols)
+        # The PET may be in its audio loop: the sound source did not survive
+        # the restart, so LEAVE at the packet boundary where buf ends, and
+        # read() starts audio mode again from the position
+        self.source.audio = st.get("audio", False)
+        self.resume_audio = st.get("audio_session", False)
 
     def fps(self):
         dt = time.monotonic() - self.t0
@@ -1319,8 +1333,9 @@ def pack(items, width):
 
 
 class Display:
-    """Full-screen terminal view: the frame just sent (PETSCII approximated
-    with Unicode, green like the PET), settings, live statistics, hotkeys and
+    """Full-screen terminal view: what the PET shows (PETSCII approximated
+    with Unicode, green like the PET), or the search screen while the
+    terminal search is open, then settings, live statistics, hotkeys and
     recent events. Redrawn at most 10 times a second."""
 
     GREEN, INV, NOINV, RESET = "\x1b[32m", "\x1b[7m", "\x1b[27m", "\x1b[0m"
@@ -1809,7 +1824,7 @@ def main():
     if DISPLAY is None and keys.fd is not None:
         say("keys: b/B brightness, c/C contrast, g/G gamma, d dither, z zoom, r reset b/c/g/d/z, "
             "1/2/3/4 seek -60/-10/+10/+60 s, 5/6 frame -1/+1, ! rewind to start, space pause, s search, "
-            "h toggle status/help on the PET (lowercase up, uppercase down)")
+            "h toggle status/help on the PET, a audio mode (lowercase up, uppercase down)")
     graceful_stop(stream)
     try:
         serve(a.port, stream, not a.quiet, keys)

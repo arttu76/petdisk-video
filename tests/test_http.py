@@ -193,5 +193,45 @@ class RestartTest(unittest.TestCase):
             srv.stop()
 
 
+@unittest.skipUnless(HAVE_FFMPEG, "ffmpeg and ffprobe are not installed")
+class AudioRestartTest(unittest.TestCase):
+    """A self-restart while the PET plays audio: the new process sends
+    LEAVE, then audio mode starts again, so the PET hears no noise."""
+
+    def test_audio_goes_on(self):
+        def clip(s):
+            path = os.path.join(s.dir, "tone.mp4")
+            subprocess.run(["ffmpeg", "-v", "error", "-y",
+                            "-f", "lavfi", "-i", "testsrc=duration=20:size=320x240:rate=25",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=20",
+                            "-shortest", "-pix_fmt", "yuv420p", path], check=True)
+            return path
+
+        srv = ServerProcess(clip).start()
+        try:
+            srv.read_video("VIDEO80.SEQ", 1)
+            self.assertEqual(srv.get("file=K65&l=1"), (200, b"0\r\n"))   # A: audio mode
+            before = srv.read_video("VIDEO80.SEQ", 2)
+            t = time.time() + 5
+            os.utime(os.path.join(srv.dir, "convert.py"), (t, t))
+            after = srv.read_video("VIDEO80.SEQ", 4, start=len(before))
+            srv.wait_log("continuing the stream after restart")
+            data = before + after
+            frames = decode(data, 2000)
+            self.assertEqual(frames[-1][0], "audio")
+            # after the first AUDIO marker: packets, a LEAVE at a packet
+            # start, then a new screen and the AUDIO marker again
+            start = next(i for i in range(len(data))
+                         if data[i] == server.AUDIO and decode(data[:i + 1], 2000)[-1:] == frames[-1:])
+            rest = data[start + 1:]
+            k = 0
+            while k < len(rest) and rest[k] != server.LEAVE:
+                k += server.AUDIO_PACKET
+            self.assertLess(k, len(rest), "no LEAVE at a packet start")
+            self.assertEqual(decode(rest[k + 1:], 2000)[-1][0], "audio")
+        finally:
+            srv.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

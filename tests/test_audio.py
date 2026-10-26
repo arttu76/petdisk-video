@@ -2,6 +2,7 @@
 the video stream, and the switch between video and audio mode."""
 
 import os
+import pickle
 import tempfile
 import threading
 import time
@@ -52,7 +53,6 @@ class PdmTest(unittest.TestCase):
         self.assertGreater(np.corrcoef(heard[200:-200], want[200:-200])[0, 1], 0.95)
 
     def test_bytes(self):
-        self.assertEqual(convert.Silence().read(4), bytes(4))
         self.assertEqual(len(convert.PDM().bytes(np.zeros(800, np.float32))), 100)
 
 
@@ -356,6 +356,35 @@ class SessionTest(unittest.TestCase):
         self.offset = 0
         screen = decode(self.blocks(4), 2000)[-1][1]
         self.assertEqual(screen[80:], bytes([160]) * 1920)
+
+    def test_self_restart_in_audio_mode(self):
+        # server.py changed: the new process gets the state. The PET is in
+        # its audio loop, so LEAVE first, then audio mode starts again
+        data = self.blocks(4)
+        state = pickle.loads(pickle.dumps(self.stream.save_state()))
+        src = FakeSource(bytes([160]) * 2000)
+        src.media, src.url = "clip.mp4", self.src.url
+        stream = server.Stream(src)
+        stream.load_state(state)
+        self.assertTrue(src.audio)
+        for i in range(4):
+            data += stream.read(self.offset + i * BLOCK, self.offset + (i + 1) * BLOCK)
+        old, rest = packets(after_marker(data))
+        self.assertGreater(len(old), 0)
+        self.assertIsNotNone(rest, "no LEAVE at a packet boundary")
+        frames = decode(rest, 2000)
+        self.assertEqual(frames[-1][0], "audio")                  # audio mode again
+        self.assertEqual(FakeFeed.made[-1].start, 75.0)           # from the position
+        self.assertGreater(len(packets(after_marker(rest))[0]), 0)
+
+    def test_self_restart_in_video_mode_has_no_leave(self):
+        self.src.audio = False
+        data = self.blocks(4)
+        state = pickle.loads(pickle.dumps(self.stream.save_state()))
+        stream = server.Stream(FakeSource(bytes([160]) * 2000))
+        stream.load_state(state)
+        more = stream.read(self.offset, self.offset + BLOCK)
+        self.assertEqual(set(more), {server.PAD})                 # the same frame: padding
 
     def test_pause_and_seek_while_audio_plays(self):
         self.blocks(4)

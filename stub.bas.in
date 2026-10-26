@@ -19,7 +19,7 @@
 # Line 12 moves the top of BASIC memory (MEMSIZ, $34-$35) to $1000, so that
 # the strings stay below the video frame buffer at $1000 and the audio ring
 # buffer at $1800-$3FFF, also on a 16 KB PET. CLR applies it. The old value
-# waits in the second tape buffer (826-827), and line 30 puts it back when
+# waits in the second tape buffer (826-827), and line 410 puts it back when
 # PDV ends, so BASIC has all its memory again.
 #
 # The server stops (Ctrl+C): the machine code returns with 2046 set, or the

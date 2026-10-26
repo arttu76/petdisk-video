@@ -494,7 +494,7 @@ class AudioStream:
 
     def __init__(self, media, start, rate, log=None, loop_start=0.0, method="clip"):
         self.media, self.rate, self.log, self.loop_start = media, rate, log, loop_start
-        self.pdm = AUDIO_METHODS[method]()
+        self.encoder = AUDIO_METHODS[method]()     # Clip or PDM
         self.ff = None
         self.open(start)
 
@@ -532,7 +532,7 @@ class AudioStream:
         return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
 
     def encode(self, samples):
-        return self.pdm.bytes(samples)
+        return self.encoder.bytes(samples)
 
     def read(self, n):
         return self.encode(self.samples(n))
@@ -542,13 +542,3 @@ class AudioStream:
             self.ff.kill()
             self.ff.wait()
             self.ff = None
-
-
-class Silence:
-    """Audio bytes with no sound: all bits 0, so CB2 does not move."""
-
-    def read(self, n):
-        return bytes(n)
-
-    def close(self):
-        pass
