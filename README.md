@@ -3,7 +3,7 @@
 ![A Commodore 8296 shows a Star Fox title screen in PETSCII characters](docs/example1.jpg)
 ![A Commodore 8296 shows the title text of the film 2001 in PETSCII: "Beyond love, beyond death"](docs/example2.jpg)
 
-PETdisk Video lets you search YouTube on a Commodore PET and watch the videos on its screen in PETSCII. A PC does the work: it gets the video, converts it to PETSCII while it plays, and streams it to the PET through a PETdisk MAX network drive. The PC can also play a video file. You control everything from the PET keyboard: search, pause, seek, loop a part of the video, and adjust the brightness, contrast, gamma and dithering.
+PETdisk Video lets you search YouTube on a Commodore PET and watch the videos on its screen in PETSCII. A PC does the work: it gets the video, converts it to PETSCII while it plays, and streams it to the PET through a PETdisk MAX network drive. The PC can also play a video file. You control everything from the PET keyboard: search, pause, seek, loop a part of the video, and adjust the brightness, contrast, gamma and dithering. In audio mode, the PET plays the sound of the video instead, with a slow slide show of its pictures.
 
 ## Quick start
 
@@ -14,6 +14,7 @@ You need Docker on the PC, and a PETdisk MAX with device 10 set to this PC (see 
 3. Type search words and press RETURN. Then type the number of a video and press RETURN.
 4. Enjoy the video.
 5. Press H to show or hide the help and status.
+6. Press A to hear the sound of the video, with a slow slide show. Press A again to see the video.
 
 Easy peasy!
 
@@ -35,6 +36,7 @@ Hardware:
 - A PETdisk MAX on the IEEE-488 port of the PET.
 - A 2.4 GHz WiFi network. The PETdisk MAX does not support 5 GHz.
 - A PC on the same network, which runs the server.
+- For audio mode: a speaker on the CB2 line of the PET. The 8296 and the later 4000 and 8000 boards have a speaker for the bell. Older PETs need an amplifier on the CB2 pin of the user port.
 
 The PET programs `PDV80` and `PDV40` are ready in `serve/`. You do not need to build them.
 
@@ -77,8 +79,8 @@ Other PET models, BASIC 2 and the ATmega version (v1) of the PETdisk MAX are not
 
 ## Files
 
-- `server.py` imitates `petdisk.php`. It serves the files in `serve/`, the endless virtual files `VIDEO80.SEQ` (80 columns) and `VIDEO40.SEQ` (40 columns), and the search screen files `RESULTS80.SEQ` and `RESULTS40.SEQ`.
-- `convert.py` holds the PETSCII conversion, the ffmpeg decoding and the yt-dlp calls that the server uses.
+- `server.py` imitates `petdisk.php`. It serves the files in `serve/`, the endless virtual files `VIDEO80.SEQ` (80 columns) and `VIDEO40.SEQ` (40 columns), which also carry the sound in audio mode, and the search screen files `RESULTS80.SEQ` and `RESULTS40.SEQ`.
+- `convert.py` holds the PETSCII conversion, the ffmpeg decoding of pictures and sound, the 1-bit sound, and the yt-dlp calls that the server uses.
 - `petscii_unicode.py` maps PET screen codes to Unicode characters for the server's terminal view.
 - `serve/PDV80.PRG` and `serve/PDV40.PRG` are the built PET programs for 80 and 40 columns.
 - `run-docker.sh` builds the server image when necessary, runs the server in a container and removes the container when the server stops.
@@ -121,7 +123,7 @@ The script `run-docker.sh` builds the image and starts the server in a container
 
 Without a video, the PET goes directly to the YouTube search. A video loops, also from a URL. The arguments are the options of `server.py`, see "With Python". The first start builds the image `pdv`, which takes a few minutes. Later starts build the image again only when a file of the server changed. A video file can be in any directory, because the script mounts its directory in the container. With `--port`, the script publishes that port instead of port 8000.
 
-Press Ctrl+C to stop the server. The script then removes the container. The image stays, so the next start is fast. `./run-docker.sh --clean` removes the image.
+Press Ctrl+C to stop the server. First the PET ends PDV, see "Stopping the server". Then the script removes the container. The image stays, so the next start is fast. `./run-docker.sh --clean` removes the image.
 
 At every start, the container updates yt-dlp first, because YouTube changes often and the image does not. To skip the update, for example without Internet access, start the script as `PDV_NO_UPDATE=1 ./run-docker.sh`.
 
@@ -153,6 +155,8 @@ python3 server.py video.mp4 --brightness 0.1 --contrast 1.5 --gamma 1.2 --dither
 ```
 
 `--zoom fill` or `--zoom stretch` sets the start zoom mode. The default is `fit`.
+
+`--audio-method pdm` makes the sound in audio mode with a delta-sigma modulator. The default, `clip`, suits the small PET speaker better, see "Audio mode".
 
 `--aspect` sets the shape of the PET picture on the monitor, as width divided by height. The default, 1.8, is an estimate for an 80-column PET. If circles look too tall, raise it. If they look too wide, lower it. On a 40-column PET, start with `--aspect 1.33`.
 
@@ -197,6 +201,7 @@ These keys work on the PET and in the server terminal. In the terminal, lowercas
 | 7 | clear the loop marks | | The video plays to its end again. |
 | S | YouTube search |  | Stops the video and shows the search screen, see "YouTube search". |
 | H | help and status |  | Shows the settings, the hotkeys and the timeline on the top rows of the PET screen, or hides them. |
+| A | audio mode on or off |  | Plays the sound of the video with a slow slide show of its pictures, or goes back to the video, see "Audio mode". |
 
 In the server terminal, the cursor keys also seek: up is forward 1 minute, down is back 1 minute, right is forward 10 seconds and left is back 10 seconds.
 
@@ -225,6 +230,20 @@ While the server searches, asks YouTube for more results or opens a video, the t
 
 The search also works in the server terminal. Press S, type the same entries in the field below the frame, and press RETURN after each entry. The field stays open until a video starts or an empty entry goes back to the video. ESC closes the field. While the PET shows its own search screen, it asks the server every 2.5 seconds whether a video was picked in the server terminal, and then starts it.
 
+## Audio mode
+
+Press A on the PET or in the server terminal. The PET then plays the sound of the video from the current position. Press A again to go back to the video, which continues where the sound is.
+
+The PET shows the time in the title on the top row: `AUDIO MODE (1:23) - PRESS A FOR VIDEO`. On a 40-column PET the title is `AUDIO (1:23) - A: VIDEO`. At the start the title shows `BUFFERING` for about 1 to 3 seconds, while the server and the PET prepare the sound. During a pause it shows `PAUSED`.
+
+Rows 1 to 24 show a slide show. The server sends the pictures slowly, cell by cell, in the bytes that the sound leaves free, about 90 bytes per second. It sends only the cells that differ from the screen. Each picture shows the moment at which its drawing starts. A completely new picture takes about 10 to 25 seconds. A similar picture, or a picture with large dark areas, is faster. A new picture comes at most every 5 seconds. When another video starts, the PET first clears the old picture.
+
+The PET can play only 1-bit sound: its CB2 line is either on or off. The server sends 22,000 bits per second, each bit the sign of the sound (`--audio-method clip`). The sound is distorted, like the speaker of an old PC, but melodies and speech are easy to recognize. The other method, `--audio-method pdm`, can reproduce the sound more exactly, but it needs a speaker that plays low frequencies. On the speaker of an 8296, it gives mostly hiss.
+
+The keys work as in video mode, for example seek, pause and search. Each key press causes a short break, and the sound starts again after about 1.5 seconds. Changes in the server terminal take effect without a key press on the PET: A, another video from the search, a seek and a pause. The PET first plays the sound in its buffer, up to about 3.5 seconds.
+
+The server terminal shows the same screen as the PET, with the same delay.
+
 ## The server terminal
 
 In a terminal, the server shows a full-screen view:
@@ -235,6 +254,7 @@ In a terminal, the server shows a full-screen view:
 4. Over the last 5 seconds: the frame rate, with the frames of the slowest and the fastest second (min/max), the transfer rate, and the min, 90th percentile and max of frame sizes and request gaps.
 5. The size of the last frame in bytes, and the size of a full frame (all screen codes: 2001 bytes for 80 columns), with the last frame as a percentage of it.
 6. The newest event, for example a key press or a yt-dlp error.
+7. In red: a countdown when the server could not get a video and tries again, and the state of a stop (see "Stopping the server").
 
 ## How it all works, step by step
 
@@ -246,6 +266,7 @@ In a terminal, the server shows a full-screen view:
 6. When a request for the next 512 bytes arrives and a new frame is ready, the server encodes the frame in the shortest way. A delta frame has only the cells whose character is different from the frame that the PET shows. A run-length key frame has the whole screen, with runs of equal characters packed. A plain key frame has all 2000 characters. When no new frame is ready, the rest of the 512 bytes is padding `$FD`, so the PET gets the next frame as soon as it exists. The server remembers what it sent, so that a PETdisk retry of the same range gets the same bytes.
 7. On the PET, the machine code reads the marker byte of each frame and builds the frame in a RAM buffer. A key frame fills the buffer, a run-length frame unpacks into it, and a delta frame skips and overwrites cells in it. Padding is skipped. When a frame is complete, the buffer is copied to the screen memory in about 20 ms, so frames do not tear. Then it reads the next marker byte.
 8. A key press: the machine code returns to BASIC with the key code. BASIC closes the video file, opens and closes a file named `K<key code>` (the server applies the key: a setting, a seek, pause) and opens the video file again. The PETdisk asks the server for the size and then for offset 0, which starts a new session with a key frame. The playback clock on the server continues, so the video goes on from where it was. RUN/STOP ends the program.
+9. Audio mode: at a frame boundary, the server sends a screen with the title and the marker `$FA`. From then on the stream carries packets of sound, time and picture, see below. The machine code fills a ring buffer of 10 KB at `$1800-$3FFF`, which covers the pauses of the PETdisk, and plays the bits with the shift register of its VIA on CB2, one bit every 42 µs. Interrupts are off while the sound plays, so the machine code checks the keyboard itself.
 
 Each part of the video stream starts with a marker byte:
 
@@ -256,8 +277,18 @@ Each part of the video stream starts with a marker byte:
 | `$FE` | delta frame | Pairs of a skip and a count (0 to 255 each), each followed by count screen codes. The pair (0, 0) ends the frame. A skip over 255 cells uses pairs (255, 0). | After the first frame of a session, when it is the shortest of the three. This is the usual frame during playback. |
 | `$FD` | padding | Nothing. | After a frame, to fill the rest of a 512-byte block when no new frame is ready. The PET skips it. |
 | `$FC` | nothing to play | Nothing. | Only as the first byte of a session, when the server has no video. The PET then goes to the search screen. |
+| `$FA` | audio mode | Packets of 512 bytes, see below. | At a frame boundary, when audio mode is on. |
+| `$F9` | the server stops | Nothing. | After Ctrl+C on the server: at a frame boundary, in audio mode after `$FF` at a packet start, or as the first byte of a session. PDV then ends, see "Stopping the server". |
 
-The PET program and the server must be of the same version. An older `PDV80` or `PDV40` does not know run-length frames.
+In audio mode, each packet of 512 bytes has three parts:
+
+- 9 screen codes for the time field in the title.
+- A picture block of 16 bytes for the slide show. It holds commands with absolute screen positions, so that the PET can apply each block alone. A literal command has 2 bytes with the position and the length (1 to 14), followed by that many screen codes. A repeat command has 2 bytes with the position, a count (1 to 255) and one screen code. The byte `$FF` ends a block early.
+- 487 sound bytes, 8 bits each, bit 7 first.
+
+The PET shows the time and the picture block of a packet when it plays the sound of that packet. At a packet start, the byte `$FF` instead of the time field means that video frames follow again. Text in the time field is never `$FF`.
+
+The PET program and the server must be of the same version. An older `PDV80` or `PDV40` does not know run-length frames, audio mode or the stop marker.
 
 ## How the PET talks to the server
 
@@ -273,7 +304,7 @@ During video playback:
 During playback, a hotkey interrupts the stream, because the stock firmware can keep only one file open:
 
 1. The machine code returns to BASIC with the key code. BASIC closes the video file.
-2. BASIC opens and closes a file named `K<key code>`, for example `K73` for I. The server applies the key when the PETdisk asks for the size of this file, and answers size 0.
+2. BASIC opens and closes a file named `K<key code>`, for example `K66` for B. The server applies the key when the PETdisk asks for the size of this file, and answers size 0.
 3. BASIC opens the video file again. The request for offset 0 starts a new session with a key frame. The playback clock on the server did not stop, so the video continues from where it was.
 
 On the search screen:
@@ -281,7 +312,7 @@ On the search screen:
 - The search screen reads the file `RESULTS80` (or `RESULTS40`), which the server makes from the current results.
 - Search text goes in pieces: files named `Q` plus up to 15 characters, then a file named only `Q`, which starts the search.
 - A result number, N or P goes to the server as a file named `C<entry>`, for example `C23` or `CN`.
-- While the search screen waits for keys, the PET reads the 1-byte file `PICK` every 2.5 seconds. It holds `1` when the search screen was closed on the server, for example by a video picked in the server terminal. The PET then opens the video file and plays the video.
+- While the search screen waits for keys, the PET reads the 1-byte file `PICK` every 2.5 seconds. It holds `1` when the search screen was closed on the server, for example by a video picked in the server terminal. The PET then opens the video file and plays the video. It holds `2` when the server stops, and PDV then ends.
 
 ## Tests
 
@@ -299,6 +330,8 @@ The tests need Python, numpy, Pillow and ffmpeg. Without ffmpeg, the tests that 
 - `test_handle.py`: the `petdisk.php` requests.
 - `test_convert.py`: the PETSCII conversion, ffmpeg decoding and zoom, and the yt-dlp calls.
 - `test_http.py`: the server as a process over HTTP, also a self-restart while the video plays.
+- `test_audio.py`: audio mode: the 1-bit sound, the packets, the background feed, the slide show, and the switches between video and audio mode within the stream.
+- `test_stop.py`: the stop after Ctrl+C and SIGTERM, also with a server process.
 - `test_vice.py`: optional, see below.
 - `pdvtest.py`: shared helpers, for example a decoder for the video stream.
 
@@ -310,12 +343,18 @@ tests/vice/run.sh -v
 
 The first start builds the image `pdv-vice-test`, which takes a few minutes. The image does not contain ROMs. The script finds the PET and drive ROMs of the Flathub VICE and mounts them read-only in the container. To use other ROMs, set `PDV_VICE_ROMS` to a VICE data directory that has the directories `PET` and `DRIVES`. The arguments of the script go to `unittest`, for example `tests/vice/run.sh -v -k frames_80`.
 
-## Do not stop the server while the PET plays
+## Stopping the server
 
-If the PETdisk MAX cannot connect to the server, the stock firmware reads a null pointer and the PETdisk crashes. The PET then waits forever. Power-cycle the PET to recover.
+If the PETdisk MAX cannot connect to the server, the stock firmware reads a null pointer and the PETdisk crashes. The PET then waits forever, and you must power-cycle the PET. So the server stops in two steps:
 
-- When `server.py` or `convert.py` changes, the server restarts itself. It passes its listening socket and the stream state on to the new process, so the PET sees no interruption.
-- Stop the server with Ctrl+C only when the PET does not play video.
+1. Press Ctrl+C in the server terminal, or stop the container with `docker stop`. The server keeps its port open and tells the PET to end PDV. The terminal shows this in red.
+2. At its next request, the PET gets the stop signal. PDV clears the screen and shows `SERVER STOPPED. TYPE RUN TO START AGAIN`, with `RUN` two rows lower and the cursor on it. The server then stops about 2 seconds after the last request of the PET. If PDV does not run, it stops after 4 seconds, and in any case after 20 seconds at the latest.
+
+When the server runs again, press RETURN on the PET. The program is still in memory, so you do not need to load it again.
+
+Do not press Ctrl+C a second time while the server waits for the PET. A second Ctrl+C stops the server at once, and the PETdisk can crash.
+
+When `server.py` or `convert.py` changes, the server restarts itself. It passes its listening socket and the stream state on to the new process, so the PET sees no interruption.
 
 ![HAL 9000's red eye from the film 2001: A Space Odyssey, shown in green PETSCII on a Commodore 8296](docs/hal.jpg)
 
