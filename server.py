@@ -50,8 +50,9 @@ LEAVE = 0xFF    # in audio mode, at a packet start: back to video frames
 STOPPED = 0xF9  # the server stops: the PET ends PDV with a message
 # Audio mode (A key): bits per second that the PET plays. Its VIA shifts a
 # bit every 42 cycles (23.8 kHz), plus a short pause after each byte until
-# the next byte goes in. Tune this by ear if the pitch is off.
-AUDIO_RATE = 22000
+# the next byte goes in. Measured on an 8296 with a recorded frequency
+# sweep: 20,300-20,400 bits per second, about 57 cycles of pause a byte.
+AUDIO_RATE = 20350
 AUDIO_PREFILL_BYTES = 16 * 256               # the PET buffers this much first
 AUDIO_PREFILL = AUDIO_PREFILL_BYTES * 8 / AUDIO_RATE   # in seconds of sound
 AUDIO_METHOD = "clip"   # set by --audio-method: clip or pdm, see convert.py

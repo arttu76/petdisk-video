@@ -238,7 +238,9 @@ The PET shows the time in the title on the top row: `AUDIO MODE (1:23) - PRESS A
 
 Rows 1 to 24 show a slide show. The server sends the pictures slowly, cell by cell, in the bytes that the sound leaves free, about 90 bytes per second. It sends only the cells that differ from the screen. Each picture shows the moment at which its drawing starts. A completely new picture takes about 10 to 25 seconds. A similar picture, or a picture with large dark areas, is faster. A new picture comes at most every 5 seconds. When another video starts, the PET first clears the old picture.
 
-The PET can play only 1-bit sound: its CB2 line is either on or off. The server sends 22,000 bits per second, each bit the sign of the sound (`--audio-method clip`). The sound is heavily distorted. The other method, `--audio-method pdm`, can reproduce the sound more exactly, but it needs a speaker that plays low frequencies. On the speaker of an 8296, it gives mostly hiss.
+The PET can play only 1-bit sound: its CB2 line is either on or off. The server sends about 20,350 bits per second, each bit the sign of the sound (`--audio-method clip`). The sound is heavily distorted. The other method, `--audio-method pdm`, can reproduce the sound more exactly, but it needs a speaker that plays low frequencies. On the speaker of an 8296, it gives mostly hiss.
+
+Before it makes the bits, the server evens out the level of the sound and then cuts the sound above 3 kHz. The 1-bit sound cannot reproduce high tones cleanly and makes noise of them. In this order, the high tones become silence instead. The filter is `AUDIO_FILTER` in `convert.py`.
 
 The keys work as in video mode, for example seek, pause and search. Each key press causes a short break, and the sound starts again after about 1.5 seconds. Changes in the server terminal take effect without a key press on the PET: A, another video from the search, a seek and a pause. The PET first plays the sound in its buffer, up to about 3 seconds.
 

@@ -430,7 +430,10 @@ def gray_frames(source, fps, width, height, stretch=False, max_frames=None,
 
 # ---- audio for the PET: 1-bit sound through the VIA shift register
 
-AUDIO_FILTER = "highpass=f=150,lowpass=f=4500,dynaudnorm=f=150:g=15"
+# The level is evened out first, then the sound above 3 kHz is cut (48 dB
+# per octave). In this order the gain does not raise the high tones again:
+# the 1-bit sound makes noise of them, and the gate of Clip makes silence.
+AUDIO_FILTER = "dynaudnorm=f=150:g=15," + ",".join(["lowpass=f=3000"] * 4)
 PDM_GAIN = 0.6           # a second-order modulator is stable below about 0.7
 
 

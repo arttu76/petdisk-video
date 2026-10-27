@@ -46,7 +46,7 @@ class PdmTest(unittest.TestCase):
 
     def test_a_tone_comes_back_out(self):
         rate = server.AUDIO_RATE
-        t = np.arange(rate) / rate
+        t = np.arange(rate // 8 * 8) / rate               # whole bytes
         tone = 0.8 * np.sin(2 * np.pi * 440 * t).astype(np.float32)
         heard = lowpass(unpack(convert.PDM().bytes(tone)))
         want = tone * convert.PDM_GAIN
